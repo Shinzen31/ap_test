@@ -10,9 +10,6 @@ ARG https_proxy
 ARG no_proxy
 
 # ---- System deps ----
-# Behind HTTPS MITM proxy:
-# - Bootstrap CA certs by temporarily disabling apt HTTPS verification
-# - Avoid security.ubuntu.com by routing all pockets through archive.ubuntu.com
 RUN set -eux; \
     printf '%s\n' \
       'Acquire::https::Verify-Peer "false";' \
@@ -36,20 +33,16 @@ RUN python3 -m pip install --upgrade pip setuptools wheel
 WORKDIR /opt
 
 # ---- Pin PyTorch nightly CPU (available in current nightly index) ----
-# NOTE: The old nightly 2.8.0.dev20250506+cpu is no longer present in the nightly index.
 ARG TORCH_INDEX_URL="https://download.pytorch.org/whl/nightly/cpu"
 ARG TORCH_VERSION="2.11.0.dev20260121+cpu"
 RUN python3 -m pip install --no-cache-dir \
     --index-url "${TORCH_INDEX_URL}" \
     "torch==${TORCH_VERSION}"
 
-# ---- AutoParallel repo ----
-ARG AUTOPARALLEL_REPO="https://github.com/meta-pytorch/autoparallel.git"
-ARG AUTOPARALLEL_REF="main"
-RUN git clone "${AUTOPARALLEL_REPO}" /opt/autoparallel && \
-    cd /opt/autoparallel && \
-    git checkout "${AUTOPARALLEL_REF}" && \
-    python3 -m pip install -e .
+# ---- AutoParallel (copied from build context to avoid GitHub TLS issues) ----
+# Expect: third_party/autoparallel exists in build context
+COPY third_party/autoparallel /opt/autoparallel
+RUN cd /opt/autoparallel && python3 -m pip install -e .
 
 # ---- Runtime deps for your scripts ----
 RUN python3 -m pip install --no-cache-dir \
