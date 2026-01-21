@@ -10,34 +10,23 @@ ARG https_proxy
 ARG no_proxy
 
 # ---- System deps ----
-# This environment is behind an HTTPS MITM proxy.
-# Bootstrap approach:
-#   1) Temporarily disable apt HTTPS verification (bootstrap only)
-#   2) Force all Ubuntu pockets (including -security) to use archive.ubuntu.com over HTTPS
-#      to avoid security.ubuntu.com MITM trust issues
-#   3) Install ca-certificates and toolchain
-#   4) Remove the insecure apt config and do a normal apt-get update
+# Behind HTTPS MITM proxy:
+# - Bootstrap CA certs by temporarily disabling apt HTTPS verification
+# - Avoid security.ubuntu.com by routing all pockets through archive.ubuntu.com
 RUN set -eux; \
-    # 1) temporarily disable apt https verification (bootstrap only)
-    cat >/etc/apt/apt.conf.d/99insecure-proxy <<'EOF' \
-Acquire::https::Verify-Peer "false"; \
-Acquire::https::Verify-Host "false"; \
-EOF \
-    ; \
-    # 2) force sources to https and avoid security.ubuntu.com
+    printf '%s\n' \
+      'Acquire::https::Verify-Peer "false";' \
+      'Acquire::https::Verify-Host "false";' \
+      > /etc/apt/apt.conf.d/99insecure-proxy; \
     sed -i 's|http://archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' /etc/apt/sources.list; \
     sed -i 's|http://security.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' /etc/apt/sources.list; \
     sed -i 's|https://security.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' /etc/apt/sources.list; \
-    \
     apt-get update; \
     apt-get install -y --no-install-recommends \
       ca-certificates curl git \
       build-essential pkg-config \
-      python${PYTHON_VERSION} python${PYTHON_VERSION}-venv python3-pip \
-    ; \
-    # 3) remove bootstrap-only insecure config
+      python${PYTHON_VERSION} python${PYTHON_VERSION}-venv python3-pip; \
     rm -f /etc/apt/apt.conf.d/99insecure-proxy; \
-    # 4) normal update (now without security.ubuntu.com)
     apt-get update; \
     rm -rf /var/lib/apt/lists/*
 
