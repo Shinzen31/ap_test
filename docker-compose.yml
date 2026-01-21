@@ -4,13 +4,16 @@ services:
       context: .
       network: host
       args:
-        # 代理：让 build 阶段 (apt/pip/git) 能走宿主机代理
+        # proxy for build stage
         http_proxy: "http://127.0.0.1:3128"
         https_proxy: "http://127.0.0.1:3128"
         no_proxy: "${no_proxy}"
 
-        # 对齐 README 指定的 torch nightly
-        TORCH_WHL_URL: "https://download.pytorch.org/whl/nightly/cpu/torch-2.8.0.dev20250506%2Bcpu-cp311-cp311-linux_x86_64.whl"
+        # pin torch nightly version (exact)
+        TORCH_VERSION: "2.8.0.dev20250506+cpu"
+        TORCH_INDEX_URL: "https://download.pytorch.org/whl/nightly/cpu"
+
+        # autoparallel
         AUTOPARALLEL_REPO: "https://github.com/meta-pytorch/autoparallel.git"
         AUTOPARALLEL_REF: "main"
 
@@ -20,7 +23,7 @@ services:
     shm_size: "8g"
 
     environment:
-      # 代理：运行时也走代理（pip/git/可能的外部访问）
+      # proxy for runtime too
       http_proxy: "http://127.0.0.1:3128"
       https_proxy: "http://127.0.0.1:3128"
       no_proxy: "${no_proxy}"
