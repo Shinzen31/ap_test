@@ -305,41 +305,54 @@ def build_example_inputs(tok, batch: int, seq_len: int, device: str):
 # -----------------------------
 def capture_fx(model, example_inputs, save_fx_path: str = "", save_fx_readable_path: str = ""):
     """
-    目标：至少拿到一个可用于“placement 枚举/编译 pass”的 FX 图。
-    说明：
-      - 输出 forward FX 作为统一入口；
-      - 只负责“实验记录”，不做结果分析。
+    torch 2.11 dev 下，torch._dynamo.export 对输出类型要求更严格：
+    - transformers 默认可能返回包含 DynamicCache 的 ModelOutput，导致 export 失败
+    - 解决：强制 use_cache=False，并且 wrapper forward 只返回 logits(Tensor)
     """
     meta = {"torch": torch.__version__, "status": None, "note": None}
-
     t0 = time.perf_counter()
+
     try:
         with torch.no_grad():
-            # exported = torch._dynamo.export(model, *example_inputs, aten_graph=True)
-            # ---- Disable KV cache for export: avoid returning transformers.cache_utils.DynamicCache ----
-            orig_use_cache = getattr(model.config, "use_cache", None)
-            try:
-                if hasattr(model, "config") and orig_use_cache is not None:
-                    model.config.use_cache = False
+            # ---- Force-disable cache at config level (both config and generation_config if present) ----
+            orig_cfg_use_cache = None
+            orig_gen_use_cache = None
 
-                def _fw(input_ids):
-                    out = model(input_ids=input_ids, use_cache=False)
+            if hasattr(model, "config") and hasattr(model.config, "use_cache"):
+                orig_cfg_use_cache = model.config.use_cache
+                model.config.use_cache = False
+
+            if hasattr(model, "generation_config") and hasattr(model.generation_config, "use_cache"):
+                orig_gen_use_cache = model.generation_config.use_cache
+                model.generation_config.use_cache = False
+
+            try:
+                input_ids = example_inputs[0]
+
+                # Wrapper: return ONLY logits (Tensor), never DynamicCache/past_key_values
+                def _fw(input_ids_):
+                    out = model(input_ids=input_ids_, use_cache=False, return_dict=True)
                     return out.logits
 
-                exported = torch._dynamo.export(_fw, example_inputs[0], aten_graph=True)
+                exported = torch._dynamo.export(_fw, input_ids, aten_graph=True)
                 fwd_gm = exported[0] if isinstance(exported, tuple) else exported
-            finally:
-                if hasattr(model, "config") and orig_use_cache is not None:
-                    model.config.use_cache = orig_use_cache
 
-        fwd_gm = exported[0] if isinstance(exported, tuple) else exported
+            finally:
+                # restore cache flags
+                if orig_cfg_use_cache is not None:
+                    model.config.use_cache = orig_cfg_use_cache
+                if orig_gen_use_cache is not None:
+                    model.generation_config.use_cache = orig_gen_use_cache
+
         meta["status"] = "ok_fwd_fx"
+
     except Exception as e:
         meta["status"] = "fail"
         meta["note"] = repr(e)
         raise RuntimeError(
             "Failed to capture FX via torch._dynamo.export. "
-            "Try smaller seq_len/batch, or disable dynamo on unsupported ops."
+            "On torch 2.11 dev, this commonly happens if outputs include non-Tensor objects "
+            "(e.g., transformers DynamicCache)."
         ) from e
 
     meta["capture_time_s"] = time.perf_counter() - t0
@@ -350,12 +363,12 @@ def capture_fx(model, example_inputs, save_fx_path: str = "", save_fx_readable_p
 
     if save_fx_readable_path:
         try:
-            # 让后续分析不必加载 pt 文件也能快速浏览结构
             write_text(save_fx_readable_path, str(fwd_gm.graph))
         except Exception as e:
             write_text(save_fx_readable_path, f"[failed to write readable fx graph] {repr(e)}")
 
     return {"gm": fwd_gm, "meta": meta}
+
 
 
 # -----------------------------
