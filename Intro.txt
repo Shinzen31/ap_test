@@ -1,0 +1,16 @@
+你之前我给你的这两个脚本：
+
+run_docker_experiment.sh
+run_docker_analyze.sh
+
+
+在你当前这个节点上，就是正确用法。
+
+1️⃣ 跑实验（生成 outputs）
+cd ap_test   # 你的项目目录
+chmod +x run_docker_experiment.sh
+./run_docker_experiment.sh
+
+2️⃣ 跑分析（不需要重跑实验）
+chmod +x run_docker_analyze.sh
+./run_docker_analyze.sh

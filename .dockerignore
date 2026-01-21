@@ -1,0 +1,16 @@
+# outputs and caches
+outputs/
+analysis/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.ipynb_checkpoints/
+.cache/
+# local git
+.git/
+# large artifacts
+*.pt
+*.pth
+*.bin
+*.safetensors

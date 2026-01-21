@@ -1,0 +1,26 @@
+services:
+  ap:
+    build:
+      context: .
+      args:
+        # 对齐 README 指定的 torch nightly
+        TORCH_WHL_URL: "https://download.pytorch.org/whl/nightly/cpu/torch-2.8.0.dev20250506%2Bcpu-cp311-cp311-linux_x86_64.whl"
+        AUTOPARALLEL_REPO: "https://github.com/meta-pytorch/autoparallel.git"
+        AUTOPARALLEL_REF: "main"
+    image: ap-llama3-cpu:torch-2.8.0.dev20250506
+    working_dir: /workspace
+    shm_size: "8g"
+    environment:
+      HF_HOME: /cache/huggingface
+      TRANSFORMERS_CACHE: /cache/huggingface/transformers
+      HF_HUB_DISABLE_TELEMETRY: "1"
+      TOKENIZERS_PARALLELISM: "false"
+      PYTHONUNBUFFERED: "1"
+    volumes:
+      # 当前文件夹：两份脚本 + 产出 outputs
+      - "${PWD}:/workspace:rw"
+      # 模型目录（你给的路径不变）：~/models/Meta-Llama-3-8B -> 容器 /models/Meta-Llama-3-8B
+      - "${HOME}/models:/models:ro"
+      # HF cache（避免每次容器重建损失缓存）
+      - "${HOME}/.cache/ap_hf:/cache:rw"
+    command: ["/bin/bash"]
