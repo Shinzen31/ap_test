@@ -4,12 +4,42 @@ FROM ubuntu:22.04
 ARG DEBIAN_FRONTEND=noninteractive
 ARG PYTHON_VERSION=3.11
 
+# Optional proxy args (passed from docker-compose build.args)
+ARG http_proxy
+ARG https_proxy
+ARG no_proxy
+
 # ---- System deps ----
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates curl git \
-    build-essential pkg-config \
-    python${PYTHON_VERSION} python${PYTHON_VERSION}-venv python3-pip \
-    && rm -rf /var/lib/apt/lists/*
+# This environment is behind an HTTPS MITM proxy.
+# Bootstrap approach:
+#   1) Temporarily disable apt HTTPS verification (bootstrap only)
+#   2) Force all Ubuntu pockets (including -security) to use archive.ubuntu.com over HTTPS
+#      to avoid security.ubuntu.com MITM trust issues
+#   3) Install ca-certificates and toolchain
+#   4) Remove the insecure apt config and do a normal apt-get update
+RUN set -eux; \
+    # 1) temporarily disable apt https verification (bootstrap only)
+    cat >/etc/apt/apt.conf.d/99insecure-proxy <<'EOF' \
+Acquire::https::Verify-Peer "false"; \
+Acquire::https::Verify-Host "false"; \
+EOF \
+    ; \
+    # 2) force sources to https and avoid security.ubuntu.com
+    sed -i 's|http://archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' /etc/apt/sources.list; \
+    sed -i 's|http://security.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' /etc/apt/sources.list; \
+    sed -i 's|https://security.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' /etc/apt/sources.list; \
+    \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+      ca-certificates curl git \
+      build-essential pkg-config \
+      python${PYTHON_VERSION} python${PYTHON_VERSION}-venv python3-pip \
+    ; \
+    # 3) remove bootstrap-only insecure config
+    rm -f /etc/apt/apt.conf.d/99insecure-proxy; \
+    # 4) normal update (now without security.ubuntu.com)
+    apt-get update; \
+    rm -rf /var/lib/apt/lists/*
 
 RUN ln -sf /usr/bin/python${PYTHON_VERSION} /usr/bin/python3
 RUN python3 -m pip install --upgrade pip setuptools wheel
@@ -17,7 +47,6 @@ RUN python3 -m pip install --upgrade pip setuptools wheel
 WORKDIR /opt
 
 # ---- Pin PyTorch nightly CPU wheel (matches AutoParallel README) ----
-# AutoParallel README: "This currently works on PyTorch 2.8.0.dev20250506."  :contentReference[oaicite:1]{index=1}
 ARG TORCH_WHL_URL="https://download.pytorch.org/whl/nightly/cpu/torch-2.8.0.dev20250506%2Bcpu-cp311-cp311-linux_x86_64.whl"
 RUN python3 -m pip install --no-cache-dir "${TORCH_WHL_URL}"
 
