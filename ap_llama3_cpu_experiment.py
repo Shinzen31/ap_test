@@ -315,7 +315,23 @@ def capture_fx(model, example_inputs, save_fx_path: str = "", save_fx_readable_p
     t0 = time.perf_counter()
     try:
         with torch.no_grad():
-            exported = torch._dynamo.export(model, *example_inputs, aten_graph=True)
+            # exported = torch._dynamo.export(model, *example_inputs, aten_graph=True)
+            # ---- Disable KV cache for export: avoid returning transformers.cache_utils.DynamicCache ----
+            orig_use_cache = getattr(model.config, "use_cache", None)
+            try:
+                if hasattr(model, "config") and orig_use_cache is not None:
+                    model.config.use_cache = False
+
+                def _fw(input_ids):
+                    out = model(input_ids=input_ids, use_cache=False)
+                    return out.logits
+
+                exported = torch._dynamo.export(_fw, example_inputs[0], aten_graph=True)
+                fwd_gm = exported[0] if isinstance(exported, tuple) else exported
+            finally:
+                if hasattr(model, "config") and orig_use_cache is not None:
+                    model.config.use_cache = orig_use_cache
+
         fwd_gm = exported[0] if isinstance(exported, tuple) else exported
         meta["status"] = "ok_fwd_fx"
     except Exception as e:
