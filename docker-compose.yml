@@ -4,20 +4,23 @@ services:
       context: .
       network: host
       args:
-        # proxy for build stage
+        # proxy for build stage (apt/pip/git)
         http_proxy: "http://127.0.0.1:3128"
         https_proxy: "http://127.0.0.1:3128"
         no_proxy: "${no_proxy}"
 
-        # pin torch nightly version (exact)
-        TORCH_VERSION: "2.8.0.dev20250506+cpu"
+        # torch nightly index + pinned version (must exist in the index)
         TORCH_INDEX_URL: "https://download.pytorch.org/whl/nightly/cpu"
+        TORCH_VERSION: "2.11.0.dev20260121+cpu"
 
         # autoparallel
         AUTOPARALLEL_REPO: "https://github.com/meta-pytorch/autoparallel.git"
         AUTOPARALLEL_REF: "main"
 
-    image: ap-llama3-cpu:torch-2.8.0.dev20250506
+        # python
+        PYTHON_VERSION: "3.11"
+
+    image: ap-llama3-cpu:torch-2.11.0.dev20260121
     network_mode: host
     working_dir: /workspace
     shm_size: "8g"
