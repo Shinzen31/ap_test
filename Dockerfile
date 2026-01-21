@@ -31,13 +31,22 @@ RUN set -eux; \
     rm -rf /var/lib/apt/lists/*
 
 RUN ln -sf /usr/bin/python${PYTHON_VERSION} /usr/bin/python3
+
+# pip tooling
 RUN python3 -m pip install --upgrade pip setuptools wheel
 
 WORKDIR /opt
 
-# ---- Pin PyTorch nightly CPU wheel (matches AutoParallel README) ----
-ARG TORCH_WHL_URL="https://download.pytorch.org/whl/nightly/cpu/torch-2.8.0.dev20250506%2Bcpu-cp311-cp311-linux_x86_64.whl"
-RUN python3 -m pip install --no-cache-dir "${TORCH_WHL_URL}"
+# ---- Pin PyTorch nightly (matches AutoParallel README) ----
+# IMPORTANT: avoid direct wheel URL (often blocked/403 by enterprise gateways).
+# Use PyTorch nightly CPU index instead.
+# We still pin exact version to 2.8.0.dev20250506+cpu.
+ARG TORCH_VERSION="2.8.0.dev20250506+cpu"
+ARG TORCH_INDEX_URL="https://download.pytorch.org/whl/nightly/cpu"
+
+RUN python3 -m pip install --no-cache-dir \
+    --index-url "${TORCH_INDEX_URL}" \
+    "torch==${TORCH_VERSION}"
 
 # ---- AutoParallel repo (default: meta-pytorch/autoparallel main) ----
 ARG AUTOPARALLEL_REPO="https://github.com/meta-pytorch/autoparallel.git"
