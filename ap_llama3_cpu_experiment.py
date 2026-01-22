@@ -308,18 +308,51 @@ def _restore_kv_cache(model, state: Dict[str, Any]):
 def _extract_graph_module(obj: Any) -> Optional[torch.fx.GraphModule]:
     """
     Root fix for the reported error:
-    Torch 2.11 dev joint-export outputs are not stable:
-    - may be GraphModule
-    - may be tuple/list containing GM
-    - may be ExportedProgram-like with .graph_module / .module() / etc.
-    This extractor is recursive and best-effort.
+    Torch dev 版本 joint-export 的返回结构非常不稳定：
+    - 可能是 GraphModule
+    - 可能是 dict / dataclass / ExportedProgram-like / JointExportResult-like
+    - 可能直接给 torch.fx.Graph（需要 wrap 成 GraphModule）
+    这里做递归 best-effort 提取。
     """
     if obj is None:
         return None
 
+    # 1) direct GraphModule
     if isinstance(obj, torch.fx.GraphModule):
         return obj
 
+    # 2) direct Graph -> wrap into GraphModule (minimal root)
+    if isinstance(obj, torch.fx.Graph):
+        try:
+            import torch.nn as nn
+            return torch.fx.GraphModule(nn.Module(), obj)
+        except Exception:
+            return None
+
+    # 3) dict-like
+    if isinstance(obj, dict):
+        # 优先尝试常见 key（joint 优先，其次 fwd/bwd）
+        key_order = [
+            "joint_graph_module", "joint_gm", "joint_module", "joint",
+            "graph_module", "gm",
+            "fwd_graph_module", "fwd_gm", "fwd_module", "fw_module", "forward",
+            "bwd_graph_module", "bwd_gm", "bwd_module", "bw_module", "backward",
+            "module",
+            "graph",
+        ]
+        for k in key_order:
+            if k in obj:
+                gm = _extract_graph_module(obj.get(k))
+                if gm is not None:
+                    return gm
+        # 否则遍历所有 value
+        for v in obj.values():
+            gm = _extract_graph_module(v)
+            if gm is not None:
+                return gm
+        return None
+
+    # 4) tuple/list
     if isinstance(obj, (tuple, list)):
         for x in obj:
             gm = _extract_graph_module(x)
@@ -327,11 +360,21 @@ def _extract_graph_module(obj: Any) -> Optional[torch.fx.GraphModule]:
                 return gm
         return None
 
-    # common attribute patterns
-    for attr in ["graph_module", "gm", "module", "graph"]:
+    # 5) ExportedProgram-like / result object: try common attrs
+    # 注意：某些对象的 .graph 是 torch.fx.Graph，我们上面已支持 wrap
+    attr_order = [
+        "joint_graph_module", "joint_gm", "joint_module", "joint",
+        "graph_module", "gm",
+        "fwd_graph_module", "fwd_gm", "fwd_module", "fw_module",
+        "bwd_graph_module", "bwd_gm", "bwd_module", "bw_module",
+        "module",
+        "graph",
+    ]
+    for attr in attr_order:
         if hasattr(obj, attr):
             try:
                 v = getattr(obj, attr)
+                # 有的字段是 method
                 if callable(v):
                     v = v()
                 gm = _extract_graph_module(v)
@@ -339,6 +382,59 @@ def _extract_graph_module(obj: Any) -> Optional[torch.fx.GraphModule]:
                     return gm
             except Exception:
                 pass
+
+    return None
+
+
+def _deep_find_graph_module(obj: Any, max_visits: int = 200000) -> Optional[torch.fx.GraphModule]:
+    """
+    仅用于 joint export 提取失败时的兜底：
+    递归/图遍历 raw 返回对象的引用图，直接搜寻 torch.fx.GraphModule 或 torch.fx.Graph。
+    只在失败路径触发，不影响正常成功路径。
+    """
+    import gc
+    import torch.nn as nn
+
+    if obj is None:
+        return None
+
+    seen = set()
+    stack = [obj]
+
+    while stack and len(seen) < max_visits:
+        cur = stack.pop()
+        if cur is None:
+            continue
+        cid = id(cur)
+        if cid in seen:
+            continue
+        seen.add(cid)
+
+        if isinstance(cur, torch.fx.GraphModule):
+            return cur
+
+        if isinstance(cur, torch.fx.Graph):
+            try:
+                return torch.fx.GraphModule(nn.Module(), cur)
+            except Exception:
+                pass
+
+        # expand children (cheap first)
+        try:
+            if isinstance(cur, dict):
+                stack.extend(list(cur.values()))
+                continue
+            if isinstance(cur, (list, tuple, set)):
+                stack.extend(list(cur))
+                continue
+        except Exception:
+            pass
+
+        # generic object graph expansion
+        try:
+            stack.extend(gc.get_referents(cur))
+        except Exception:
+            continue
 
     return None
 
@@ -362,6 +458,8 @@ def capture_joint_fx(model, example_inputs: Tuple[torch.Tensor, ...], run_dir: s
         "method": None,
         "note": None,
     }
+    meta["raw_type"] = None
+    meta["raw_keys"] = None
 
     input_ids = example_inputs[0]
 
@@ -383,6 +481,16 @@ def capture_joint_fx(model, example_inputs: Tuple[torch.Tensor, ...], run_dir: s
             if hasattr(texp, "aot_export_joint_with_descriptors"):
                 meta["method"] = "torch.export.aot_export_joint_with_descriptors"
                 raw = texp.aot_export_joint_with_descriptors(loss_fn, (input_ids,), {})
+
+                meta["raw_type"] = str(type(raw))
+                if isinstance(raw, dict):
+                    meta["raw_keys"] = list(raw.keys())
+                else:
+                    try:
+                        meta["raw_keys"] = [k for k in dir(raw) if not k.startswith("_")][:200]
+                    except Exception:
+                        meta["raw_keys"] = None
+
                 gm = _extract_graph_module(raw)
 
                 # Always dump raw attempt for postmortem
@@ -404,6 +512,16 @@ def capture_joint_fx(model, example_inputs: Tuple[torch.Tensor, ...], run_dir: s
 
                 meta["method"] = "torch._functorch.aot_autograd.aot_export_joint_simple"
                 raw = aot_export_joint_simple(loss_fn, (input_ids,))
+
+                meta["raw_type"] = str(type(raw))
+                if isinstance(raw, dict):
+                    meta["raw_keys"] = list(raw.keys())
+                else:
+                    try:
+                        meta["raw_keys"] = [k for k in dir(raw) if not k.startswith("_")][:200]
+                    except Exception:
+                        meta["raw_keys"] = None
+
                 gm = _extract_graph_module(raw)
 
                 # Always dump raw attempt for postmortem
@@ -417,6 +535,12 @@ def capture_joint_fx(model, example_inputs: Tuple[torch.Tensor, ...], run_dir: s
                     pass
             except Exception as e:
                 meta["note"] = (meta["note"] or "") + f" | [aot_export_joint_simple failed] {repr(e)}"
+
+        # ---- Root fix (fallback): deep scan raw to find any fx GraphModule/Graph ----
+        if gm is None and raw is not None:
+            gm = _deep_find_graph_module(raw, max_visits=200000)
+            if gm is not None:
+                meta["note"] = (meta["note"] or "") + " | [fallback] deep_scan_found_fx_graphmodule"
 
         if gm is None:
             meta["status"] = "fail_no_graphmodule"
