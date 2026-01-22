@@ -29,10 +29,34 @@ import platform
 import subprocess
 import sys
 import time
+import warnings
 from datetime import datetime
 from typing import Any, Dict, Optional, Tuple, List
 
 import torch
+
+# -----------------------------
+# Warning + cache root fixes (ONLY what user asked)
+# -----------------------------
+# Root fix for Transformers cache warning: prefer HF_HOME (Transformers v5 direction)
+os.environ.setdefault("HF_HOME", "/cache/huggingface")
+
+# Narrow warning filters: only suppress the specific noisy FutureWarnings seen in logs.
+warnings.filterwarnings(
+    "ignore",
+    message=r"Using `TRANSFORMERS_CACHE` is deprecated.*",
+    category=FutureWarning,
+)
+warnings.filterwarnings(
+    "ignore",
+    message=r"`torch_dtype` is deprecated! Use `dtype` instead!*",
+    category=FutureWarning,
+)
+warnings.filterwarnings(
+    "ignore",
+    message=r"export\(f, \*args, \*\*kwargs\) is deprecated.*",
+    category=FutureWarning,
+)
 
 try:
     from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -192,6 +216,23 @@ def example_inputs_meta(example_inputs: Tuple[torch.Tensor, ...]) -> Dict[str, A
 # -----------------------------
 # Model: Llama3-8B
 # -----------------------------
+def _from_pretrained_dtype_kw(dtype: torch.dtype) -> Dict[str, Any]:
+    """
+    ONLY for warning root-fix:
+    - Prefer new `dtype=` kw if supported by current transformers
+    - Fallback to legacy `torch_dtype=` for compatibility
+    """
+    try:
+        import inspect
+
+        sig = inspect.signature(AutoModelForCausalLM.from_pretrained)
+        if "dtype" in sig.parameters:
+            return {"dtype": dtype}
+    except Exception:
+        pass
+    return {"torch_dtype": dtype}
+
+
 def load_llama3(model_path: str, device: str, dtype: str, allow_cpu_low_precision: bool = False):
     if AutoModelForCausalLM is None or AutoTokenizer is None:
         raise RuntimeError("transformers not available. Please `pip install transformers accelerate`.")
@@ -220,7 +261,7 @@ def load_llama3(model_path: str, device: str, dtype: str, allow_cpu_low_precisio
 
     model = AutoModelForCausalLM.from_pretrained(
         model_path,
-        torch_dtype=torch_dtype,  # warning 可忽略；为兼容不同 transformers 版本保留 torch_dtype
+        **_from_pretrained_dtype_kw(torch_dtype),  # root fix for `torch_dtype` deprecation warning
         low_cpu_mem_usage=True,
         local_files_only=True,
         trust_remote_code=True,
@@ -265,17 +306,40 @@ def _restore_kv_cache(model, state: Dict[str, Any]):
 
 
 def _extract_graph_module(obj: Any) -> Optional[torch.fx.GraphModule]:
-    # Common patterns across torch.export / aot outputs
+    """
+    Root fix for the reported error:
+    Torch 2.11 dev joint-export outputs are not stable:
+    - may be GraphModule
+    - may be tuple/list containing GM
+    - may be ExportedProgram-like with .graph_module / .module() / etc.
+    This extractor is recursive and best-effort.
+    """
+    if obj is None:
+        return None
+
     if isinstance(obj, torch.fx.GraphModule):
         return obj
+
+    if isinstance(obj, (tuple, list)):
+        for x in obj:
+            gm = _extract_graph_module(x)
+            if gm is not None:
+                return gm
+        return None
+
+    # common attribute patterns
     for attr in ["graph_module", "gm", "module", "graph"]:
         if hasattr(obj, attr):
-            v = getattr(obj, attr)
-            if isinstance(v, torch.fx.GraphModule):
-                return v
-    # exported program: obj.graph_module may exist
-    if hasattr(obj, "module") and isinstance(getattr(obj, "module"), torch.fx.GraphModule):
-        return getattr(obj, "module")
+            try:
+                v = getattr(obj, attr)
+                if callable(v):
+                    v = v()
+                gm = _extract_graph_module(v)
+                if gm is not None:
+                    return gm
+            except Exception:
+                pass
+
     return None
 
 
@@ -320,6 +384,16 @@ def capture_joint_fx(model, example_inputs: Tuple[torch.Tensor, ...], run_dir: s
                 meta["method"] = "torch.export.aot_export_joint_with_descriptors"
                 raw = texp.aot_export_joint_with_descriptors(loss_fn, (input_ids,), {})
                 gm = _extract_graph_module(raw)
+
+                # Always dump raw attempt for postmortem
+                try:
+                    write_text(os.path.join(run_dir, "joint_export_raw_repr.txt"), repr(raw)[:200000])
+                except Exception:
+                    pass
+                try:
+                    try_torch_save(os.path.join(run_dir, "joint_export_raw.pt"), raw)
+                except Exception:
+                    pass
         except Exception as e:
             meta["note"] = f"[torch.export attempt failed] {repr(e)}"
 
@@ -331,11 +405,34 @@ def capture_joint_fx(model, example_inputs: Tuple[torch.Tensor, ...], run_dir: s
                 meta["method"] = "torch._functorch.aot_autograd.aot_export_joint_simple"
                 raw = aot_export_joint_simple(loss_fn, (input_ids,))
                 gm = _extract_graph_module(raw)
+
+                # Always dump raw attempt for postmortem
+                try:
+                    write_text(os.path.join(run_dir, "joint_export_raw_repr.txt"), repr(raw)[:200000])
+                except Exception:
+                    pass
+                try:
+                    try_torch_save(os.path.join(run_dir, "joint_export_raw.pt"), raw)
+                except Exception:
+                    pass
             except Exception as e:
                 meta["note"] = (meta["note"] or "") + f" | [aot_export_joint_simple failed] {repr(e)}"
 
         if gm is None:
             meta["status"] = "fail_no_graphmodule"
+            meta["capture_time_s"] = time.perf_counter() - t0
+            write_json(os.path.join(run_dir, "joint_export_meta.json"), meta)
+
+            # Dump json-friendly raw if present
+            if raw is not None:
+                try:
+                    write_json(os.path.join(run_dir, "joint_export_raw.json"), _json_friendly(raw, max_depth=6))
+                except Exception as e:
+                    write_json(
+                        os.path.join(run_dir, "joint_export_raw.json"),
+                        {"__error__": repr(e), "repr": repr(raw)[:2000]},
+                    )
+
             raise RuntimeError(
                 "Joint export did not yield a torch.fx.GraphModule. "
                 "See joint_export_meta.json and joint_export_raw.* for details."
@@ -383,6 +480,7 @@ def _to_float(x) -> Optional[float]:
     s = str(x)
     # parse first float-like token
     import re
+
     m = re.search(r"[-+]?\d+(\.\d+)?([eE][-+]?\d+)?", s)
     if not m:
         return None
