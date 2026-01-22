@@ -11,29 +11,33 @@ SEQ_LEN="${SEQ_LEN:-16}"
 DTYPE="${DTYPE:-fp32}"
 ALLOW_CPU_LOW_PRECISION="${ALLOW_CPU_LOW_PRECISION:-0}"
 
-CAPTURE_JOINT="${CAPTURE_JOINT:-1}"                # MUST be 1 for档1
+CAPTURE_JOINT="${CAPTURE_JOINT:-1}"                # MUST be 1 for 档1
 SAVE_JOINT_READABLE="${SAVE_JOINT_READABLE:-1}"
 RECORD_ENV="${RECORD_ENV:-1}"
 DO_DIM_PERMUTE_SENS="${DO_DIM_PERMUTE_SENS:-1}"
 
+# ---- Build image (no user mapping needed here) ----
 docker compose build
 
-docker compose run --rm ap bash -lc "
-  python3 -c 'import torch; print(\"torch=\", torch.__version__)'
-  python3 -c 'import autoparallel; print(\"autoparallel import ok\")'
+# ---- Run experiment as host user (FIX: avoid root-owned outputs) ----
+docker compose run --rm \
+  --user "$(id -u):$(id -g)" \
+  ap bash -lc "
+    python3 -c 'import torch; print(\"torch=\", torch.__version__)'
+    python3 -c 'import autoparallel; print(\"autoparallel import ok\")'
 
-  python3 ./ap_llama3_cpu_experiment.py \
-    --model_path /models/Meta-Llama-3-8B \
-    --meshes ${MESHES} \
-    --outdir ${OUTDIR} \
-    --timeout_s ${TIMEOUT_S} \
-    --batch ${BATCH} \
-    --seq_len ${SEQ_LEN} \
-    --dtype ${DTYPE} \
-    --allow_cpu_low_precision ${ALLOW_CPU_LOW_PRECISION} \
-    --capture_joint ${CAPTURE_JOINT} \
-    --save_joint_readable ${SAVE_JOINT_READABLE} \
-    --record_env ${RECORD_ENV} \
-    --do_dim_permute_sensitivity ${DO_DIM_PERMUTE_SENS} \
-    --write_csv 1
-"
+    python3 ./ap_llama3_cpu_experiment.py \
+      --model_path /models/Meta-Llama-3-8B \
+      --meshes ${MESHES} \
+      --outdir ${OUTDIR} \
+      --timeout_s ${TIMEOUT_S} \
+      --batch ${BATCH} \
+      --seq_len ${SEQ_LEN} \
+      --dtype ${DTYPE} \
+      --allow_cpu_low_precision ${ALLOW_CPU_LOW_PRECISION} \
+      --capture_joint ${CAPTURE_JOINT} \
+      --save_joint_readable ${SAVE_JOINT_READABLE} \
+      --record_env ${RECORD_ENV} \
+      --do_dim_permute_sensitivity ${DO_DIM_PERMUTE_SENS} \
+      --write_csv 1
+  "
