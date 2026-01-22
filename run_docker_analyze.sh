@@ -1,20 +1,21 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# ---- Tunables (override via env) ----
 OUTDIR="${OUTDIR:-outputs}"
-
-# 如果你知道 memory_cost 的单位并且可与预算对比，再设置 MEMORY_BUDGET_GB，否则留空/0
-MEMORY_BUDGET_GB="${MEMORY_BUDGET_GB:-0}"
+REPORT_DIR="${REPORT_DIR:-}"            # default: <OUTDIR>/analysis/<ts> inside script
+W_COMM="${W_COMM:-0.8}"
+W_RESHARD="${W_RESHARD:-1.2}"
+W_SOLVE_TIME="${W_SOLVE_TIME:-0.05}"
 
 docker compose run --rm ap bash -lc "
-  if [ ! -f ${OUTDIR}/runs.jsonl ]; then
-    echo \"ERROR: ${OUTDIR}/runs.jsonl not found. Run experiment first.\"
-    exit 2
-  fi
+  python3 -c 'import torch; print(\"torch=\", torch.__version__)'
+  test -d ${OUTDIR} || (echo \"OUTDIR not found: ${OUTDIR}\" && exit 2)
 
-  if [ \"${MEMORY_BUDGET_GB}\" != \"0\" ]; then
-    python3 ./ap_llama3_cpu_analyze.py --outdir ${OUTDIR} --memory_budget_gb ${MEMORY_BUDGET_GB}
-  else
-    python3 ./ap_llama3_cpu_analyze.py --outdir ${OUTDIR}
-  fi
+  python3 ./ap_llama3_cpu_analyze.py \
+    --outdir ${OUTDIR} \
+    ${REPORT_DIR:+--report_dir ${REPORT_DIR}} \
+    --w_comm ${W_COMM} \
+    --w_reshard ${W_RESHARD} \
+    --w_solve_time ${W_SOLVE_TIME}
 "
