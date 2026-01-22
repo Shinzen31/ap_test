@@ -1,31 +1,35 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+
 """
-ap_llama3_cpu_analyze.py
+ap_llama3_cpu_analyze.py  (ANALYSIS ONLY)
 
-结果分析脚本（与实验/记录脚本解耦）：
-- 读取实验脚本输出的 outputs/runs.jsonl（以及每个 run_dir 下的 summary/meta/autoparallel_out.json 等）
-- 计算派生指标（total_cost、reshard_share、comm_share、comm/compute 等）
-- 在不 profiling 的前提下给出“是否值得继续”的直观判定（green/yellow/red + 原因）
-- 生成：
-  - <outdir>/analysis/analysis_runs.csv（逐条 run 的增强表）
-  - <outdir>/analysis/analysis_best_by_mesh.csv（每个 mesh 选择一个“最值得”的 run）
-  - <outdir>/analysis/analysis_report.md（可读报告）
-  - <outdir>/analysis/analysis_summary.json（结构化汇总）
+输入：实验脚本 ap_llama3_cpu_experiment.py 产出的 outputs/ 目录
+输出：report_dir 下
+  - summary_table.csv
+  - summary_table.json
+  - report.md
+  - redflags.json
+  - best_by_mesh.json
+  - sensitivity_summary.json
 
-用法示例：
-  python3 ap_llama3_cpu_analyze.py --outdir outputs
-  python3 ap_llama3_cpu_analyze.py --runs_jsonl outputs/runs.jsonl
-  python3 ap_llama3_cpu_analyze.py --outdir outputs --memory_budget_gb 64
-  python3 ap_llama3_cpu_analyze.py --runs_jsonl outputs/runs.jsonl --runs_jsonl other_outputs/runs.jsonl
+不做 profiling：
+  只基于 cost breakdown（compute/comm/reshard/memory）、shares、solve_status、fallback/timeout 等做结构性判断。
+
+使用：
+python3 ap_llama3_cpu_analyze.py --outdir outputs
+
+可调打分：
+python3 ap_llama3_cpu_analyze.py --outdir outputs --w_comm 0.7 --w_reshard 1.3 --w_solve_time 0.05
 """
 
 import argparse
 import csv
+import glob
 import json
-import math
 import os
 import re
+import statistics
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -64,33 +68,18 @@ def write_csv(path: str, rows: List[Dict[str, Any]], fieldnames: List[str]):
             w.writerow({k: r.get(k, "") for k in fieldnames})
 
 
-def read_jsonl(path: str) -> List[Dict[str, Any]]:
-    rows = []
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            rows.append(json.loads(line))
-    return rows
-
-
 # -----------------------------
-# Numeric parsing / safe ops
+# Parsing helpers
 # -----------------------------
-_NUM_RE = re.compile(r"[-+]?\d+(\.\d+)?([eE][-+]?\d+)?")
-
-
 def to_float(x) -> Optional[float]:
     if x is None:
         return None
+    if isinstance(x, bool):
+        return None
     if isinstance(x, (int, float)):
-        if isinstance(x, bool):
-            return None
         return float(x)
-    # try string parse (e.g. "1.23", "tensor(1.23)", "1e-3")
     s = str(x)
-    m = _NUM_RE.search(s)
+    m = re.search(r"[-+]?\d+(\.\d+)?([eE][-+]?\d+)?", s)
     if not m:
         return None
     try:
@@ -100,325 +89,365 @@ def to_float(x) -> Optional[float]:
 
 
 def safe_div(a: Optional[float], b: Optional[float]) -> Optional[float]:
-    if a is None or b is None:
-        return None
-    if b == 0:
+    if a is None or b is None or b == 0:
         return None
     return a / b
 
 
-def finite(x: Optional[float]) -> bool:
-    return x is not None and isinstance(x, float) and math.isfinite(x)
+def mesh_shape_str(mesh_shape) -> str:
+    if isinstance(mesh_shape, list):
+        return "x".join(str(x) for x in mesh_shape)
+    return str(mesh_shape)
+
+
+def verdict_rank(verdict: str) -> int:
+    v = (verdict or "").lower()
+    if v == "green":
+        return 0
+    if v == "yellow":
+        return 1
+    if v == "red":
+        return 2
+    return 3
 
 
 # -----------------------------
-# Worth assessment (no profiling)
+# Load runs
 # -----------------------------
-def assess_worth(
-    solve_status: str,
+def load_runs(outdir: str) -> List[Dict[str, Any]]:
+    runs_path = os.path.join(outdir, "runs.jsonl")
+    runs: List[Dict[str, Any]] = []
+
+    if os.path.exists(runs_path):
+        with open(runs_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    runs.append(json.loads(line))
+                except Exception:
+                    continue
+        if runs:
+            return runs
+
+    # fallback: scan summary.json
+    for p in glob.glob(os.path.join(outdir, "*", "*", "summary.json")):
+        try:
+            runs.append(read_json(p))
+        except Exception:
+            pass
+    return runs
+
+
+def find_joint_capture_dirs(outdir: str) -> List[str]:
+    base = os.path.join(outdir, "_joint_capture")
+    if not os.path.isdir(base):
+        return []
+    dirs = []
+    for name in sorted(os.listdir(base)):
+        p = os.path.join(base, name)
+        if os.path.isdir(p):
+            dirs.append(p)
+    return dirs
+
+
+def load_joint_capture_meta(joint_dir: str) -> Dict[str, Any]:
+    meta_path = os.path.join(joint_dir, "joint_export_meta.json")
+    fail_path = os.path.join(joint_dir, "joint_capture_failed.json")
+    out: Dict[str, Any] = {"joint_dir": joint_dir}
+    if os.path.exists(meta_path):
+        out["ok"] = True
+        out["meta"] = read_json(meta_path)
+    elif os.path.exists(fail_path):
+        out["ok"] = False
+        out["fail"] = read_json(fail_path)
+    else:
+        out["ok"] = False
+        out["fail"] = {"error": "missing joint_export_meta.json and joint_capture_failed.json"}
+    return out
+
+
+# -----------------------------
+# Scoring / red flags
+# -----------------------------
+def compute_shares(costs: Dict[str, Any]) -> Dict[str, Optional[float]]:
+    c_compute = to_float(costs.get("compute"))
+    c_comm = to_float(costs.get("comm"))
+    c_reshard = to_float(costs.get("reshard"))
+    parts = [v for v in [c_compute, c_comm, c_reshard] if v is not None]
+    total = sum(parts) if parts else None
+    return {
+        "total_cost": total,
+        "compute": c_compute,
+        "comm": c_comm,
+        "reshard": c_reshard,
+        "compute_share": safe_div(c_compute, total),
+        "comm_share": safe_div(c_comm, total),
+        "reshard_share": safe_div(c_reshard, total),
+        "memory_cost": to_float(costs.get("memory")),
+    }
+
+
+def quality_score(
+    verdict: str,
     timeout: bool,
     fallback: bool,
-    costs: Dict[str, Any],
-    scale: Dict[str, Any],
-    memory_budget_gb: Optional[float] = None,
-    thresholds: Optional[Dict[str, float]] = None,
-) -> Dict[str, Any]:
+    solve_time_s: Optional[float],
+    shares: Dict[str, Optional[float]],
+    w_comm: float,
+    w_reshard: float,
+    w_solve_time: float,
+) -> float:
     """
-    给出直观“是否值得继续”的判定（不依赖 profiling）。
-    只用：status/timeout/fallback + cost breakdown（compute/comm/reshard/memory）+ scale（vars/cons/cands）。
-
-    thresholds 默认：
-      - red_reshard_share: 0.30
-      - yellow_reshard_share: 0.15
-      - yellow_comm_share: 0.60
-      - red_memory_budget_ratio: 0.90
-      - yellow_memory_budget_ratio: 0.75
+    低越好：综合结构性风险/代价占比。
+    - 基础：green<yellow<red<unknown
+    - penalty：timeout/fallback/缺失成本
+    - weighted：comm_share、reshard_share、solve_time
     """
-    th = {
-        "red_reshard_share": 0.30,
-        "yellow_reshard_share": 0.15,
-        "yellow_comm_share": 0.60,
-        "red_memory_budget_ratio": 0.90,
-        "yellow_memory_budget_ratio": 0.75,
-    }
-    if thresholds:
-        th.update({k: float(v) for k, v in thresholds.items()})
-
-    status = (solve_status or "").lower()
-    reasons: List[str] = []
+    base = verdict_rank(verdict) * 10.0
 
     if timeout:
-        return {
-            "verdict": "red",
-            "reasons": ["solver timeout (not actionable without reducing search space)"],
-            "recommendation": "Reduce candidate space / test smaller subgraph / increase timeout.",
-        }
-
-    if status in {"error", "fail"} or "error" in status:
-        return {
-            "verdict": "red",
-            "reasons": [f"solver error status={solve_status}"],
-            "recommendation": "Fix solver/API wiring or unsupported ops before judging strategies.",
-        }
-
+        base += 100.0
     if fallback:
-        return {
-            "verdict": "red",
-            "reasons": [f"fallback path (status={solve_status}); no real strategy to assess"],
-            "recommendation": "Ensure autoparallel is installed and entrypoint produces a real strategy.",
-        }
+        base += 50.0
 
-    c_compute = to_float(costs.get("compute"))
-    c_comm = to_float(costs.get("comm"))
-    c_reshard = to_float(costs.get("reshard"))
-    c_memory = to_float(costs.get("memory"))
+    total_cost = shares.get("total_cost")
+    if total_cost is None:
+        base += 20.0  # missing cost breakdown
 
-    parts = [v for v in [c_compute, c_comm, c_reshard] if finite(v)]
-    total_cost = sum(parts) if parts else None
+    comm_share = shares.get("comm_share")
+    reshard_share = shares.get("reshard_share")
 
-    if not finite(total_cost) or total_cost <= 0:
-        return {
-            "verdict": "yellow",
-            "reasons": ["cost breakdown missing/unparseable; cannot judge quality reliably"],
-            "recommendation": "Expose numeric costs (compute/comm/reshard/memory) from autoparallel output.",
-        }
-
-    reshard_share = safe_div(c_reshard, total_cost)
-    comm_share = safe_div(c_comm, total_cost)
-    compute_share = safe_div(c_compute, total_cost)
-
-    verdict = "green"
-
-    # reshard share
-    if finite(reshard_share):
-        if reshard_share > th["red_reshard_share"]:
-            verdict = "red"
-            reasons.append(f"reshard_share={reshard_share:.2f} > {th['red_reshard_share']:.2f} (excessive layout churn)")
-        elif reshard_share > th["yellow_reshard_share"] and verdict != "red":
-            verdict = "yellow"
-            reasons.append(f"reshard_share={reshard_share:.2f} > {th['yellow_reshard_share']:.2f} (moderate churn)")
-
-    # comm share sanity
-    if verdict != "red" and finite(comm_share):
-        if comm_share > th["yellow_comm_share"]:
-            verdict = "yellow"
-            reasons.append(f"comm_share={comm_share:.2f} > {th['yellow_comm_share']:.2f} (communication-heavy)")
-
-    # optional memory budget
-    if memory_budget_gb is not None and finite(c_memory):
-        ratio = safe_div(c_memory, memory_budget_gb)
-        if finite(ratio):
-            if ratio > th["red_memory_budget_ratio"]:
-                verdict = "red"
-                reasons.append(f"memory_cost/budget={ratio:.2f} > {th['red_memory_budget_ratio']:.2f} (high OOM risk)")
-            elif ratio > th["yellow_memory_budget_ratio"] and verdict != "red":
-                verdict = "yellow"
-                reasons.append(f"memory_cost/budget={ratio:.2f} > {th['yellow_memory_budget_ratio']:.2f} (high memory pressure)")
-
-    # if still green but no concrete reasons, add a gentle note
-    if verdict == "green" and not reasons:
-        reasons.append("no obvious structural red flags in cost breakdown (profiling still needed for real speed)")
-
-    # recommendation
-    if verdict == "green":
-        rec = "Proceed to minimal runtime validation (small seq_len/batch) and then selective profiling if needed."
-    elif verdict == "yellow":
-        rec = "Worth limited validation; consider tightening solver constraints or reducing reshard/comm if possible."
+    if comm_share is not None:
+        base += w_comm * comm_share * 100.0
     else:
-        rec = "Not worth profiling yet; address reshard/memory risk or solver feasibility first."
+        base += 5.0
 
-    # include scale hints (do not judge; just record)
-    nv = scale.get("num_vars")
-    nc = scale.get("num_constraints")
-    nd = scale.get("num_candidates")
-    if nv is not None or nc is not None or nd is not None:
-        reasons.append(f"scale(vars={nv}, cons={nc}, cands={nd})")
+    if reshard_share is not None:
+        base += w_reshard * reshard_share * 100.0
+    else:
+        base += 5.0
 
-    return {"verdict": verdict, "reasons": reasons, "recommendation": rec}
+    if solve_time_s is not None:
+        base += w_solve_time * float(solve_time_s)
+
+    return float(base)
+
+
+def redflags(row: Dict[str, Any], shares: Dict[str, Optional[float]]) -> List[str]:
+    flags: List[str] = []
+    status = (row.get("solve_status") or "").lower()
+    if row.get("timeout"):
+        flags.append("timeout")
+    if row.get("fallback"):
+        flags.append("fallback")
+    if "error" in status or status in {"fail", "no_autoparallel", "autoparallel_found_no_entry"}:
+        flags.append(f"bad_status:{row.get('solve_status')}")
+
+    rs = shares.get("reshard_share")
+    cs = shares.get("comm_share")
+    if rs is not None and rs > 0.30:
+        flags.append(f"high_reshard_share:{rs:.2f}")
+    if cs is not None and cs > 0.70:
+        flags.append(f"high_comm_share:{cs:.2f}")
+
+    if shares.get("total_cost") is None:
+        flags.append("missing_numeric_costs")
+
+    return flags
 
 
 # -----------------------------
-# Aggregation / selection
+# Reporting
 # -----------------------------
-def normalize_run(row: Dict[str, Any], source_label: str) -> Dict[str, Any]:
-    """将 runs.jsonl 每条记录规范化，并补充派生指标字段。"""
-    mesh_tag = row.get("mesh_tag") or ""
-    mesh_shape = row.get("mesh_shape") or []
-    solve_status = row.get("solve_status") or ""
-    timeout = bool(row.get("timeout", False))
-    fallback = bool(row.get("fallback", False))
-    scale = row.get("scale") or {}
-    costs = row.get("costs") or {}
-    run_dir = row.get("run_dir") or ""
-
-    c_compute = to_float(costs.get("compute"))
-    c_comm = to_float(costs.get("comm"))
-    c_reshard = to_float(costs.get("reshard"))
-    c_memory = to_float(costs.get("memory"))
-
-    parts = [v for v in [c_compute, c_comm, c_reshard] if finite(v)]
-    total_cost = sum(parts) if parts else None
-
-    reshard_share = safe_div(c_reshard, total_cost) if finite(total_cost) else None
-    comm_share = safe_div(c_comm, total_cost) if finite(total_cost) else None
-    compute_share = safe_div(c_compute, total_cost) if finite(total_cost) else None
-
-    comm_to_compute = safe_div(c_comm, c_compute)
-    reshard_to_total = reshard_share
-
-    # timestamp from run_dir if possible: outputs/<mesh_tag>/<timestamp>/
-    ts = ""
+def format_float(x: Optional[float], nd: int = 4) -> str:
+    if x is None:
+        return ""
     try:
-        # take last component
-        ts = os.path.basename(run_dir.rstrip("/"))
+        return f"{float(x):.{nd}f}"
     except Exception:
-        ts = ""
-
-    return {
-        "source": source_label,
-        "mesh_tag": mesh_tag,
-        "mesh_shape": "x".join(map(str, mesh_shape)) if isinstance(mesh_shape, list) else str(mesh_shape),
-        "timestamp": ts,
-        "solve_status": solve_status,
-        "timeout": int(timeout),
-        "fallback": int(fallback),
-        "solve_time_s": to_float(row.get("solve_time_s")),
-        "total_time_s": to_float(row.get("total_time_s")),
-        "num_vars": scale.get("num_vars"),
-        "num_constraints": scale.get("num_constraints"),
-        "num_candidates": scale.get("num_candidates"),
-        "compute_cost": c_compute,
-        "comm_cost": c_comm,
-        "reshard_cost": c_reshard,
-        "memory_cost": c_memory,
-        "total_cost": total_cost,
-        "reshard_share": reshard_to_total,
-        "comm_share": comm_share,
-        "compute_share": compute_share,
-        "comm_to_compute": comm_to_compute,
-        "run_dir": run_dir,
-    }
+        return ""
 
 
-def select_best_by_mesh(runs: List[Dict[str, Any]]) -> Dict[Tuple[str, str], Dict[str, Any]]:
-    """
-    为每个 (source, mesh_tag) 选择一个“最值得”的 run。
-    选择规则（偏向不 profiling 的策略评估）：
-      1) verdict: green > yellow > red
-      2) 在同 verdict 内，total_cost 低者优先（若无 total_cost，用 solve_time_s 低者）
-      3) 再用 reshard_share 低者作为 tie-break
-    """
-    rank = {"green": 0, "yellow": 1, "red": 2}
-
-    best: Dict[Tuple[str, str], Dict[str, Any]] = {}
+def build_summary_rows(
+    runs: List[Dict[str, Any]],
+    w_comm: float,
+    w_reshard: float,
+    w_solve_time: float,
+) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
     for r in runs:
-        key = (r.get("source", ""), r.get("mesh_tag", ""))
-        if key not in best:
-            best[key] = r
-            continue
+        costs = r.get("costs") or {}
+        shares = compute_shares(costs)
 
-        a = r
-        b = best[key]
+        solve_time_s = to_float(r.get("solve_time_s"))
+        verdict = r.get("worth_verdict") or r.get("worth", {}).get("verdict")  #兼容旧结构
 
-        ra = rank.get(a.get("worth_verdict", "red"), 2)
-        rb = rank.get(b.get("worth_verdict", "red"), 2)
-        if ra != rb:
-            if ra < rb:
-                best[key] = a
-            continue
+        score = quality_score(
+            verdict=str(verdict) if verdict is not None else "",
+            timeout=bool(r.get("timeout", False)),
+            fallback=bool(r.get("fallback", False)),
+            solve_time_s=solve_time_s,
+            shares=shares,
+            w_comm=w_comm,
+            w_reshard=w_reshard,
+            w_solve_time=w_solve_time,
+        )
 
-        # same verdict: compare total_cost if available
-        ta = a.get("total_cost")
-        tb = b.get("total_cost")
+        row = {
+            "mesh_tag": r.get("mesh_tag") or "",
+            "mesh_shape": mesh_shape_str(r.get("mesh_shape")),
+            "solve_status": r.get("solve_status") or "",
+            "timeout": int(bool(r.get("timeout", False))),
+            "fallback": int(bool(r.get("fallback", False))),
+            "solve_time_s": format_float(solve_time_s, 4),
+            "vars": (r.get("scale") or {}).get("num_vars", ""),
+            "cons": (r.get("scale") or {}).get("num_constraints", ""),
+            "cands": (r.get("scale") or {}).get("num_candidates", ""),
+            "compute_cost": format_float(shares.get("compute"), 6),
+            "comm_cost": format_float(shares.get("comm"), 6),
+            "reshard_cost": format_float(shares.get("reshard"), 6),
+            "memory_cost": format_float(shares.get("memory_cost"), 6),
+            "total_cost": format_float(shares.get("total_cost"), 6),
+            "compute_share": format_float(shares.get("compute_share"), 4),
+            "comm_share": format_float(shares.get("comm_share"), 4),
+            "reshard_share": format_float(shares.get("reshard_share"), 4),
+            "worth_verdict": (verdict or ""),
+            "quality_score": format_float(score, 4),
+            "run_dir": r.get("run_dir") or "",
+        }
+        rows.append(row)
+    return rows
 
-        if finite(ta) and finite(tb) and ta != tb:
-            if ta < tb:
-                best[key] = a
-            continue
-        if finite(ta) and not finite(tb):
-            best[key] = a
-            continue
-        if not finite(ta) and finite(tb):
-            continue
 
-        # fallback: solve_time
-        sa = a.get("solve_time_s")
-        sb = b.get("solve_time_s")
-        if finite(sa) and finite(sb) and sa != sb:
-            if sa < sb:
-                best[key] = a
-            continue
-        if finite(sa) and not finite(sb):
-            best[key] = a
-            continue
+def pick_best_by_mesh(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    by_mesh: Dict[str, List[Dict[str, Any]]] = {}
+    for row in rows:
+        k = row.get("mesh_shape") or row.get("mesh_tag") or "unknown"
+        by_mesh.setdefault(k, []).append(row)
 
-        # tie-break: lower reshard_share
-        sha = a.get("reshard_share")
-        shb = b.get("reshard_share")
-        if finite(sha) and finite(shb) and sha != shb:
-            if sha < shb:
-                best[key] = a
-
+    best: Dict[str, Any] = {}
+    for k, arr in by_mesh.items():
+        arr2 = sorted(
+            arr,
+            key=lambda x: (
+                verdict_rank(str(x.get("worth_verdict"))),
+                float(x.get("quality_score") or 1e18),
+            ),
+        )
+        best[k] = {"best": arr2[0], "top3": arr2[:3]}
     return best
 
 
-# -----------------------------
-# Report generation
-# -----------------------------
-def format_pct(x: Optional[float]) -> str:
-    if not finite(x):
-        return ""
-    return f"{100.0 * x:.1f}%"
-
-
-def format_f(x: Optional[float]) -> str:
-    if not finite(x):
-        return ""
-    # keep compact
-    return f"{x:.6g}"
-
-
-def make_markdown_report(outdir: str, all_runs: List[Dict[str, Any]], best_map: Dict[Tuple[str, str], Dict[str, Any]]) -> str:
-    now = datetime.utcnow().isoformat() + "Z"
-
-    # summary counts
-    counts = {}
-    for r in all_runs:
-        v = r.get("worth_verdict", "unknown")
-        counts[v] = counts.get(v, 0) + 1
-
-    lines = []
-    lines.append(f"# AutoParallel Results Report")
-    lines.append("")
-    lines.append(f"- Generated: {now}")
-    lines.append(f"- Input outdir: `{outdir}`")
-    lines.append("")
-    lines.append("## Verdict counts")
-    for k in ["green", "yellow", "red", "unknown"]:
-        if k in counts:
-            lines.append(f"- {k}: {counts[k]}")
-    lines.append("")
-
-    # Best per mesh (per source)
-    lines.append("## Best run per mesh (per source)")
-    lines.append("")
-    lines.append("| source | mesh_tag | verdict | total_cost | reshard_share | comm_share | solve_time_s | run_dir |")
-    lines.append("|---|---|---|---:|---:|---:|---:|---|")
-
-    best_items = sorted(best_map.items(), key=lambda kv: (kv[0][0], kv[0][1]))
-    for (source, mesh_tag), r in best_items:
-        lines.append(
-            f"| {source} | {mesh_tag} | {r.get('worth_verdict','')} | {format_f(r.get('total_cost'))} | "
-            f"{format_pct(r.get('reshard_share'))} | {format_pct(r.get('comm_share'))} | {format_f(r.get('solve_time_s'))} | "
-            f"`{r.get('run_dir','')}` |"
+def summarize_sensitivity(runs: List[Dict[str, Any]]) -> Dict[str, Any]:
+    items = []
+    for r in runs:
+        sens = r.get("dim_sensitivity")
+        if not sens or not isinstance(sens, dict):
+            continue
+        if not sens.get("supported", False):
+            continue
+        items.append(
+            {
+                "mesh_shape": mesh_shape_str(r.get("mesh_shape")),
+                "mesh_tag": r.get("mesh_tag"),
+                "changed": bool(sens.get("changed")),
+                "base_mesh": sens.get("base_mesh"),
+                "perm_mesh": sens.get("perm_mesh"),
+                "run_dir": r.get("run_dir"),
+            }
         )
 
-    lines.append("")
-    lines.append("## Notes on interpretation (no profiling)")
-    lines.append("")
-    lines.append("- `reshard_share` high typically indicates frequent layout changes (often not worth scaling).")
-    lines.append("- `comm_share` high suggests communication-heavy strategy; may be acceptable depending on target interconnect, but requires validation.")
-    lines.append("- This report does not claim real runtime speed; it is a structural/cost-model-based screening tool.")
+    changed = sum(1 for x in items if x.get("changed"))
+    total = len(items)
+    return {
+        "total_checked": total,
+        "changed_count": changed,
+        "changed_ratio": (changed / total) if total else None,
+        "items": items,
+    }
+
+
+def make_report_md(
+    outdir: str,
+    joint_meta_list: List[Dict[str, Any]],
+    rows_sorted: List[Dict[str, Any]],
+    best_by_mesh: Dict[str, Any],
+    redflag_map: Dict[str, Any],
+    sens_summary: Dict[str, Any],
+) -> str:
+    ts = datetime.utcnow().isoformat() + "Z"
+
+    def md_escape(s: str) -> str:
+        return (s or "").replace("|", "\\|")
+
+    lines: List[str] = []
+    lines.append(f"# AutoParallel Experiment Report\n")
+    lines.append(f"- Generated: `{ts}`\n")
+    lines.append(f"- Outdir: `{outdir}`\n")
+
+    # Joint capture summary
+    lines.append("\n## Joint fwd+bwd capture\n")
+    if not joint_meta_list:
+        lines.append("- No joint capture directory found under `_joint_capture/`.\n")
+    else:
+        for jm in joint_meta_list[-3:]:  # show last few
+            if jm.get("ok"):
+                meta = jm.get("meta") or {}
+                lines.append(f"- `{jm.get('joint_dir')}`: **OK** method=`{meta.get('method')}` status=`{meta.get('status')}` capture_time_s=`{meta.get('capture_time_s')}`\n")
+            else:
+                fail = jm.get("fail") or {}
+                lines.append(f"- `{jm.get('joint_dir')}`: **FAIL** error=`{fail.get('error')}`\n")
+
+    # Best by mesh
+    lines.append("\n## Best strategy per mesh (no profiling)\n")
+    for mesh, obj in best_by_mesh.items():
+        b = obj["best"]
+        lines.append(
+            f"- Mesh `{mesh}` best: verdict=`{b.get('worth_verdict')}` "
+            f"score=`{b.get('quality_score')}` "
+            f"reshard_share=`{b.get('reshard_share')}` comm_share=`{b.get('comm_share')}` "
+            f"solve_status=`{b.get('solve_status')}`\n"
+        )
+
+    # Red flags
+    lines.append("\n## Red flags\n")
+    if not redflag_map["items"]:
+        lines.append("- None\n")
+    else:
+        lines.append(f"- Total flagged runs: `{len(redflag_map['items'])}`\n")
+        for it in redflag_map["items"][:10]:
+            lines.append(
+                f"  - mesh=`{it['mesh_shape']}` verdict=`{it['worth_verdict']}` "
+                f"score=`{it['quality_score']}` flags=`{', '.join(it['flags'])}` run_dir=`{it['run_dir']}`\n"
+            )
+
+    # Sensitivity
+    lines.append("\n## Mesh dimension swap sensitivity (record-only)\n")
+    lines.append(f"- Checked: `{sens_summary.get('total_checked')}`; changed: `{sens_summary.get('changed_count')}`; ratio: `{sens_summary.get('changed_ratio')}`\n")
+
+    # Top table
+    lines.append("\n## Ranked runs (top 15)\n")
+    header = ["mesh_shape", "worth_verdict", "quality_score", "reshard_share", "comm_share", "solve_status", "run_dir"]
+    lines.append("| " + " | ".join(header) + " |")
+    lines.append("| " + " | ".join(["---"] * len(header)) + " |")
+    for r in rows_sorted[:15]:
+        lines.append(
+            "| "
+            + " | ".join(
+                [
+                    md_escape(str(r.get("mesh_shape", ""))),
+                    md_escape(str(r.get("worth_verdict", ""))),
+                    md_escape(str(r.get("quality_score", ""))),
+                    md_escape(str(r.get("reshard_share", ""))),
+                    md_escape(str(r.get("comm_share", ""))),
+                    md_escape(str(r.get("solve_status", ""))),
+                    md_escape(str(r.get("run_dir", ""))),
+                ]
+            )
+            + " |"
+        )
 
     return "\n".join(lines) + "\n"
 
@@ -428,150 +457,111 @@ def make_markdown_report(outdir: str, all_runs: List[Dict[str, Any]], best_map: 
 # -----------------------------
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--outdir", default="", help="Experiment outdir (e.g., outputs). If set, default runs_jsonl=outdir/runs.jsonl and analysis outputs under outdir/analysis/.")
-    p.add_argument("--runs_jsonl", action="append", default=[], help="Path to runs.jsonl. Can be provided multiple times for comparing multiple result sets.")
-    p.add_argument("--label", action="append", default=[], help="Optional label for each runs_jsonl. If omitted, basename(parent_dir) is used.")
-    p.add_argument("--analysis_dir", default="", help="Where to write analysis outputs. Default: <outdir>/analysis or ./analysis if outdir not set.")
-    p.add_argument("--memory_budget_gb", type=float, default=0.0, help="Optional memory budget for screening (only used if >0 and memory_cost is numeric/comparable).")
-    p.add_argument("--red_reshard_share", type=float, default=0.30)
-    p.add_argument("--yellow_reshard_share", type=float, default=0.15)
-    p.add_argument("--yellow_comm_share", type=float, default=0.60)
-    p.add_argument("--red_memory_budget_ratio", type=float, default=0.90)
-    p.add_argument("--yellow_memory_budget_ratio", type=float, default=0.75)
+    p.add_argument("--outdir", default="outputs")
+    p.add_argument("--report_dir", default="", help="default: <outdir>/analysis/<timestamp>")
+    p.add_argument("--w_comm", type=float, default=0.8)
+    p.add_argument("--w_reshard", type=float, default=1.2)
+    p.add_argument("--w_solve_time", type=float, default=0.05)
+    p.add_argument("--topk", type=int, default=15)
     args = p.parse_args()
 
-    # determine input runs.jsonl list
-    runs_paths: List[str] = list(args.runs_jsonl)
-    if args.outdir and not runs_paths:
-        runs_paths = [os.path.join(args.outdir, "runs.jsonl")]
+    outdir = args.outdir
+    runs = load_runs(outdir)
+    if not runs:
+        raise SystemExit(f"No runs found under {outdir}. Expect runs.jsonl or */*/summary.json")
 
-    if not runs_paths:
-        raise SystemExit("ERROR: Provide --outdir or at least one --runs_jsonl")
+    # report dir
+    ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    report_dir = args.report_dir.strip() or os.path.join(outdir, "analysis", ts)
+    ensure_dir(report_dir)
 
-    # labels
-    labels: List[str] = list(args.label)
-    while len(labels) < len(runs_paths):
-        rp = runs_paths[len(labels)]
-        parent = os.path.basename(os.path.dirname(os.path.abspath(rp)))
-        labels.append(parent or f"set{len(labels)}")
+    # joint capture meta
+    joint_dirs = find_joint_capture_dirs(outdir)
+    joint_meta_list = [load_joint_capture_meta(d) for d in joint_dirs]
+    write_json(os.path.join(report_dir, "joint_capture_meta.json"), {"items": joint_meta_list})
 
-    # analysis_dir
-    analysis_dir = args.analysis_dir
-    if not analysis_dir:
-        if args.outdir:
-            analysis_dir = os.path.join(args.outdir, "analysis")
-        else:
-            analysis_dir = os.path.join(".", "analysis")
-    ensure_dir(analysis_dir)
+    # compute rows
+    rows = build_summary_rows(runs, args.w_comm, args.w_reshard, args.w_solve_time)
 
-    thresholds = {
-        "red_reshard_share": args.red_reshard_share,
-        "yellow_reshard_share": args.yellow_reshard_share,
-        "yellow_comm_share": args.yellow_comm_share,
-        "red_memory_budget_ratio": args.red_memory_budget_ratio,
-        "yellow_memory_budget_ratio": args.yellow_memory_budget_ratio,
-    }
-    mem_budget = args.memory_budget_gb if args.memory_budget_gb and args.memory_budget_gb > 0 else None
+    # sort: verdict first, then score
+    rows_sorted = sorted(
+        rows,
+        key=lambda x: (
+            verdict_rank(str(x.get("worth_verdict"))),
+            float(x.get("quality_score") or 1e18),
+        ),
+    )
 
-    # load and normalize
-    all_runs: List[Dict[str, Any]] = []
-    raw_counts: List[Dict[str, Any]] = []
-
-    for rp, lab in zip(runs_paths, labels):
-        if not os.path.exists(rp):
-            raise SystemExit(f"ERROR: runs_jsonl not found: {rp}")
-        rows = read_jsonl(rp)
-        raw_counts.append({"label": lab, "runs_jsonl": rp, "num_rows": len(rows)})
-        for row in rows:
-            nr = normalize_run(row, source_label=lab)
-            worth = assess_worth(
-                solve_status=nr["solve_status"],
-                timeout=bool(nr["timeout"]),
-                fallback=bool(nr["fallback"]),
-                costs={
-                    "compute": nr["compute_cost"],
-                    "comm": nr["comm_cost"],
-                    "reshard": nr["reshard_cost"],
-                    "memory": nr["memory_cost"],
-                },
-                scale={
-                    "num_vars": nr["num_vars"],
-                    "num_constraints": nr["num_constraints"],
-                    "num_candidates": nr["num_candidates"],
-                },
-                memory_budget_gb=mem_budget,
-                thresholds=thresholds,
+    # red flags
+    flagged = []
+    for r, raw in zip(rows, runs):
+        shares = {
+            "total_cost": to_float(r.get("total_cost")),
+            "comm_share": to_float(r.get("comm_share")),
+            "reshard_share": to_float(r.get("reshard_share")),
+        }
+        flags = redflags(raw, {
+            "total_cost": to_float(raw.get("derived", {}).get("total_cost")) if isinstance(raw.get("derived"), dict) else None,
+            "comm_share": to_float(raw.get("derived", {}).get("comm_share")) if isinstance(raw.get("derived"), dict) else None,
+            "reshard_share": to_float(raw.get("derived", {}).get("reshard_share")) if isinstance(raw.get("derived"), dict) else None,
+        })
+        if flags:
+            flagged.append(
+                {
+                    "mesh_shape": r.get("mesh_shape"),
+                    "worth_verdict": r.get("worth_verdict"),
+                    "quality_score": r.get("quality_score"),
+                    "flags": flags,
+                    "run_dir": r.get("run_dir"),
+                }
             )
-            nr["worth_verdict"] = worth["verdict"]
-            nr["worth_reasons"] = " | ".join(worth.get("reasons", []))
-            nr["worth_recommendation"] = worth.get("recommendation", "")
-            all_runs.append(nr)
+    redflag_map = {"items": flagged}
+    write_json(os.path.join(report_dir, "redflags.json"), redflag_map)
 
-    # select best per mesh per source
-    best_map = select_best_by_mesh(all_runs)
+    # best per mesh
+    best_by_mesh = pick_best_by_mesh(rows)
+    write_json(os.path.join(report_dir, "best_by_mesh.json"), best_by_mesh)
 
-    # write enriched runs CSV
-    runs_csv_fields = [
-        "source",
+    # sensitivity summary
+    sens_summary = summarize_sensitivity(runs)
+    write_json(os.path.join(report_dir, "sensitivity_summary.json"), sens_summary)
+
+    # export tables
+    write_json(os.path.join(report_dir, "summary_table.json"), {"rows": rows_sorted})
+    fieldnames = [
         "mesh_tag",
         "mesh_shape",
-        "timestamp",
         "solve_status",
         "timeout",
         "fallback",
         "solve_time_s",
-        "total_time_s",
-        "num_vars",
-        "num_constraints",
-        "num_candidates",
+        "vars",
+        "cons",
+        "cands",
         "compute_cost",
         "comm_cost",
         "reshard_cost",
         "memory_cost",
         "total_cost",
-        "reshard_share",
-        "comm_share",
         "compute_share",
-        "comm_to_compute",
+        "comm_share",
+        "reshard_share",
         "worth_verdict",
-        "worth_reasons",
-        "worth_recommendation",
+        "quality_score",
         "run_dir",
     ]
-    write_csv(os.path.join(analysis_dir, "analysis_runs.csv"), all_runs, runs_csv_fields)
+    write_csv(os.path.join(report_dir, "summary_table.csv"), rows_sorted, fieldnames)
 
-    # write best-by-mesh CSV
-    best_rows = []
-    for (source, mesh_tag), r in sorted(best_map.items(), key=lambda kv: (kv[0][0], kv[0][1])):
-        best_rows.append(r)
-    write_csv(os.path.join(analysis_dir, "analysis_best_by_mesh.csv"), best_rows, runs_csv_fields)
+    # markdown report
+    md = make_report_md(outdir, joint_meta_list, rows_sorted, best_by_mesh, redflag_map, sens_summary)
+    write_text(os.path.join(report_dir, "report.md"), md)
 
-    # report.md
-    report_md = make_markdown_report(args.outdir or "", all_runs, best_map)
-    write_text(os.path.join(analysis_dir, "analysis_report.md"), report_md)
+    # also write "latest" pointer file
+    write_text(os.path.join(outdir, "analysis_latest.txt"), report_dir + "\n")
 
-    # summary.json
-    verdict_counts = {}
-    for r in all_runs:
-        v = r.get("worth_verdict", "unknown")
-        verdict_counts[v] = verdict_counts.get(v, 0) + 1
-
-    summary = {
-        "generated_utc": datetime.utcnow().isoformat() + "Z",
-        "inputs": raw_counts,
-        "analysis_dir": os.path.abspath(analysis_dir),
-        "memory_budget_gb": mem_budget,
-        "thresholds": thresholds,
-        "verdict_counts": verdict_counts,
-        "num_runs": len(all_runs),
-        "num_best": len(best_map),
-    }
-    write_json(os.path.join(analysis_dir, "analysis_summary.json"), summary)
-
-    # concise stdout
-    print(f"[OK] analysis_dir: {os.path.abspath(analysis_dir)}")
-    print(f"[OK] runs: {len(all_runs)} | best_by_mesh: {len(best_map)} | verdict_counts: {verdict_counts}")
-    print(f"[OK] wrote: analysis_runs.csv, analysis_best_by_mesh.csv, analysis_report.md, analysis_summary.json")
+    print(f"[OK] analysis report written to: {report_dir}")
+    print(f"[OK] summary_table.csv, report.md generated.")
+    print(f"[OK] analysis_latest.txt -> {report_dir}")
 
 
 if __name__ == "__main__":
