@@ -8,12 +8,15 @@ W_COMM="${W_COMM:-0.8}"
 W_RESHARD="${W_RESHARD:-1.2}"
 W_SOLVE_TIME="${W_SOLVE_TIME:-0.05}"
 
-# ---- Run analysis as host user (FIX: avoid root-owned outputs) ----
 docker compose run --rm \
   --user "$(id -u):$(id -g)" \
+  --volume /etc/passwd:/etc/passwd:ro \
+  --volume /etc/group:/etc/group:ro \
+  --env HOME=/workspace \
   ap bash -lc "
-    python3 -c 'import torch; print(\"torch=\", torch.__version__)'
+    set -euo pipefail
 
+    python3 -c 'import torch; print(\"torch=\", torch.__version__)'
     test -d ${OUTDIR} || (echo \"OUTDIR not found: ${OUTDIR}\" && exit 2)
 
     python3 ./ap_llama3_cpu_analyze.py \
