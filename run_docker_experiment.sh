@@ -16,14 +16,23 @@ SAVE_JOINT_READABLE="${SAVE_JOINT_READABLE:-1}"
 RECORD_ENV="${RECORD_ENV:-1}"
 DO_DIM_PERMUTE_SENS="${DO_DIM_PERMUTE_SENS:-1}"
 
-# ---- Build image (no user mapping needed here) ----
+# ---- Build image ----
 docker compose build
 
-# ---- Run experiment as host user (FIX: avoid root-owned outputs) ----
+# ---- Run as host user; mount passwd/group so getpass.getuser() works ----
 docker compose run --rm \
   --user "$(id -u):$(id -g)" \
+  --volume /etc/passwd:/etc/passwd:ro \
+  --volume /etc/group:/etc/group:ro \
+  --env HOME=/workspace \
+  --env TORCHINDUCTOR_CACHE_DIR=/workspace/.cache/torchinductor \
+  --env TORCHDYNAMO_CACHE_DIR=/workspace/.cache/torchdynamo \
   ap bash -lc "
+    set -euo pipefail
+    mkdir -p /workspace/.cache/torchinductor /workspace/.cache/torchdynamo
+
     python3 -c 'import torch; print(\"torch=\", torch.__version__)'
+    python3 -c 'import transformers; print(\"transformers import ok\")'
     python3 -c 'import autoparallel; print(\"autoparallel import ok\")'
 
     python3 ./ap_llama3_cpu_experiment.py \
