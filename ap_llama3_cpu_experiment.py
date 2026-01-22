@@ -1,31 +1,25 @@
-'''
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 
-如何运行（实验部分）
+"""
+ap_llama3_cpu_experiment.py  (EXPERIMENT ONLY)
 
-最常用（稳态、最少风险）：
+目标（档1：最小完整）：
+1) 生成 joint fwd+bwd graph（必须，失败则记录并退出）
+2) 基于 joint graph 调用 autoparallel solver，记录策略与 cost breakdown（含 bwd ops 的前提：solver 输入为 joint graph）
+3) 落盘所有中间产物，确保后续分析无需重跑
+4) 记录基础指标 + 非 profiling 的“策略是否优质”直观指标（worth_verdict + cost shares）
 
+运行示例：
 python3 ap_llama3_cpu_experiment.py \
-  --model_path ~/models/Meta-Llama-3-8B \
+  --model_path /models/Meta-Llama-3-8B \
   --meshes 8x8,4x16,4x4x4 \
   --outdir outputs \
   --timeout_s 1800 \
   --batch 1 --seq_len 16 \
-  --save_fx 0
-
-
-如果你想尝试省内存（仅在你确认不会影响测试时）：
-
-python3 ap_llama3_cpu_experiment.py \
-  --model_path ~/models/Meta-Llama-3-8B \
-  --mesh 8x8 \
-  --dtype bf16 \
-  --allow_cpu_low_precision 1 \
-  --batch 1 --seq_len 16
-  
-  '''
-
-
-
+  --dtype fp32 \
+  --capture_joint 1
+"""
 
 import argparse
 import csv
@@ -36,11 +30,10 @@ import subprocess
 import sys
 import time
 from datetime import datetime
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, List
 
 import torch
 
-# transformers 需要你本机已安装，并且 llama3 权重在本地或可访问
 try:
     from transformers import AutoModelForCausalLM, AutoTokenizer
 except Exception:
@@ -51,7 +44,7 @@ except Exception:
 # -----------------------------
 # Utils: mesh / io
 # -----------------------------
-def parse_mesh(s: str):
+def parse_mesh(s: str) -> List[int]:
     s = s.strip().lower()
     if "x" in s:
         parts = [int(x) for x in s.split("x") if x]
@@ -61,11 +54,11 @@ def parse_mesh(s: str):
     return [int(s)]
 
 
-def mesh_tag(shape):
+def mesh_tag(shape: List[int]) -> str:
     return "x".join(str(x) for x in shape)
 
 
-def ensure_dir(p):
+def ensure_dir(p: str):
     if p:
         os.makedirs(p, exist_ok=True)
 
@@ -76,19 +69,19 @@ def write_text(path: str, text: str):
         f.write(text)
 
 
-def write_json(path, obj):
+def write_json(path: str, obj: Any):
     ensure_dir(os.path.dirname(path))
     with open(path, "w", encoding="utf-8") as f:
         json.dump(obj, f, ensure_ascii=False, indent=2)
 
 
-def append_jsonl(path, obj):
+def append_jsonl(path: str, obj: Any):
     ensure_dir(os.path.dirname(path))
     with open(path, "a", encoding="utf-8") as f:
         f.write(json.dumps(obj, ensure_ascii=False) + "\n")
 
 
-def append_csv(path, row: dict):
+def append_csv(path: str, row: dict):
     ensure_dir(os.path.dirname(path))
     exists = os.path.exists(path)
     with open(path, "a", newline="", encoding="utf-8") as f:
@@ -98,8 +91,7 @@ def append_csv(path, row: dict):
         w.writerow(row)
 
 
-def make_run_dir(outdir, tag):
-    # 以 mesh 数字命名的目录；每次运行只生成一个时间戳子目录
+def make_run_dir(outdir: str, tag: str) -> str:
     ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
     run_dir = os.path.join(outdir, tag, ts)
     ensure_dir(run_dir)
@@ -110,17 +102,12 @@ def make_run_dir(outdir, tag):
 # Robust serialization helpers
 # -----------------------------
 def _json_friendly(obj: Any, max_depth: int = 6, _depth: int = 0) -> Any:
-    """
-    尽可能把对象转为 JSON 友好结构，无法序列化的用 repr 兜底。
-    注意：这是“记录原始信息”的工具，不做任何分析判断。
-    """
     if _depth > max_depth:
         return {"__truncated__": True, "repr": repr(obj)[:2000]}
 
     if obj is None or isinstance(obj, (bool, int, float, str)):
         return obj
 
-    # torch / numpy scalar
     if hasattr(obj, "item") and callable(getattr(obj, "item")):
         try:
             v = obj.item()
@@ -129,62 +116,44 @@ def _json_friendly(obj: Any, max_depth: int = 6, _depth: int = 0) -> Any:
         except Exception:
             pass
 
-    # torch dtype / device
     if isinstance(obj, torch.dtype):
         return str(obj)
     if isinstance(obj, torch.device):
         return str(obj)
 
-    # list / tuple
     if isinstance(obj, (list, tuple)):
         return [_json_friendly(x, max_depth=max_depth, _depth=_depth + 1) for x in obj]
 
-    # dict
     if isinstance(obj, dict):
         out = {}
         for k, v in obj.items():
-            try:
-                kk = str(k)
-            except Exception:
-                kk = repr(k)
-            out[kk] = _json_friendly(v, max_depth=max_depth, _depth=_depth + 1)
+            out[str(k)] = _json_friendly(v, max_depth=max_depth, _depth=_depth + 1)
         return out
 
-    # torch Tensor: 只记录 shape/dtype/device，避免爆文件
     if isinstance(obj, torch.Tensor):
         return {
             "__tensor__": True,
             "shape": list(obj.shape),
             "dtype": str(obj.dtype),
             "device": str(obj.device),
+            "requires_grad": bool(obj.requires_grad),
         }
 
-    # objects: 尝试提取 __dict__ 的浅层信息
     if hasattr(obj, "__dict__"):
         try:
             d = {}
             for k, v in obj.__dict__.items():
-                if k.startswith("_"):
+                if str(k).startswith("_"):
                     continue
                 d[str(k)] = _json_friendly(v, max_depth=max_depth, _depth=_depth + 1)
-            return {
-                "__object__": True,
-                "type": f"{type(obj)}",
-                "dict": d,
-                "repr": repr(obj)[:2000],
-            }
+            return {"__object__": True, "type": str(type(obj)), "dict": d, "repr": repr(obj)[:2000]}
         except Exception:
             pass
 
-    # fallback
-    return {"__repr__": True, "type": f"{type(obj)}", "repr": repr(obj)[:2000]}
+    return {"__repr__": True, "type": str(type(obj)), "repr": repr(obj)[:2000]}
 
 
 def try_torch_save(path: str, obj: Any) -> Dict[str, Any]:
-    """
-    尝试用 torch.save 保存任意对象（pickle），用于“尽量全记录”。
-    若失败，返回 error 信息，不抛异常。
-    """
     ensure_dir(os.path.dirname(path))
     try:
         torch.save(obj, path)
@@ -202,7 +171,6 @@ def capture_pip_freeze() -> str:
 
 
 def capture_torch_env() -> str:
-    # 尽量不引入额外依赖：优先 torch 自带的 collect_env（若存在）
     try:
         from torch.utils.collect_env import get_pretty_env_info
 
@@ -215,14 +183,7 @@ def example_inputs_meta(example_inputs: Tuple[torch.Tensor, ...]) -> Dict[str, A
     metas = []
     for i, t in enumerate(example_inputs):
         if isinstance(t, torch.Tensor):
-            metas.append(
-                {
-                    "index": i,
-                    "shape": list(t.shape),
-                    "dtype": str(t.dtype),
-                    "device": str(t.device),
-                }
-            )
+            metas.append({"index": i, "shape": list(t.shape), "dtype": str(t.dtype), "device": str(t.device)})
         else:
             metas.append({"index": i, "type": str(type(t)), "repr": repr(t)[:500]})
     return {"num_inputs": len(example_inputs), "inputs": metas}
@@ -232,24 +193,8 @@ def example_inputs_meta(example_inputs: Tuple[torch.Tensor, ...]) -> Dict[str, A
 # Model: Llama3-8B
 # -----------------------------
 def load_llama3(model_path: str, device: str, dtype: str, allow_cpu_low_precision: bool = False):
-    """
-    仅修改点：支持你给的 ModelScope 本地缓存目录作为 model_path。
-    - 直接对本地目录调用 transformers.from_pretrained
-    - local_files_only=True 避免误触发联网
-    - trust_remote_code=True 提升兼容性（一般不影响 Llama3）
-
-    额外（受控开关）：
-    - allow_cpu_low_precision=1 时才允许 CPU 使用 bf16/fp16（默认仍强制 fp32，避免影响 autoparallel 测试稳定性）
-    """
     if AutoModelForCausalLM is None or AutoTokenizer is None:
         raise RuntimeError("transformers not available. Please `pip install transformers accelerate`.")
-
-    # 提醒但不阻塞：temp 目录可能被清理
-    if "/._____temp/" in model_path:
-        print(
-            "[WARN] You are using a ModelScope temp cache path; it may be cleaned. "
-            "Prefer the non-temp path under hub/models/."
-        )
 
     if not os.path.isdir(model_path):
         raise FileNotFoundError(f"model_path not found or not a directory: {model_path}")
@@ -260,7 +205,7 @@ def load_llama3(model_path: str, device: str, dtype: str, allow_cpu_low_precisio
         "fp16": torch.float16,
     }.get(dtype.lower(), torch.float32)
 
-    # CPU-only：默认强制 fp32 更稳（只有显式开关才允许低精度）
+    # CPU-only：默认强制 fp32（稳定优先），除非显式允许低精度
     if device == "cpu" and not allow_cpu_low_precision:
         torch_dtype = torch.float32
 
@@ -270,13 +215,12 @@ def load_llama3(model_path: str, device: str, dtype: str, allow_cpu_low_precisio
         local_files_only=True,
         trust_remote_code=True,
     )
-    # 有些 Llama tokenizer 没有 pad_token，给一个安全兜底
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
 
     model = AutoModelForCausalLM.from_pretrained(
         model_path,
-        torch_dtype=torch_dtype,
+        torch_dtype=torch_dtype,  # warning 可忽略；为兼容不同 transformers 版本保留 torch_dtype
         low_cpu_mem_usage=True,
         local_files_only=True,
         trust_remote_code=True,
@@ -286,8 +230,7 @@ def load_llama3(model_path: str, device: str, dtype: str, allow_cpu_low_precisio
     return model, tok
 
 
-def build_example_inputs(tok, batch: int, seq_len: int, device: str):
-    # 用极小序列做图捕获，避免 CPU 上 8B 过慢
+def build_example_inputs(tok, batch: int, seq_len: int, device: str) -> Tuple[torch.Tensor, ...]:
     text = "Hello world. " * max(1, seq_len // 3)
     enc = tok(
         text,
@@ -301,97 +244,223 @@ def build_example_inputs(tok, batch: int, seq_len: int, device: str):
 
 
 # -----------------------------
-# Graph capture (CPU-friendly)
+# Joint fwd+bwd graph capture (must)
 # -----------------------------
-def capture_fx(model, example_inputs, save_fx_path: str = "", save_fx_readable_path: str = ""):
-    """
-    torch 2.11 dev 下，torch._dynamo.export 对输出类型要求更严格：
-    - transformers 默认可能返回包含 DynamicCache 的 ModelOutput，导致 export 失败
-    - 解决：强制 use_cache=False，并且 wrapper forward 只返回 logits(Tensor)
-    """
-    meta = {"torch": torch.__version__, "status": None, "note": None}
-    t0 = time.perf_counter()
+def _disable_kv_cache(model) -> Dict[str, Any]:
+    state = {"cfg": None, "gen": None}
+    if hasattr(model, "config") and hasattr(model.config, "use_cache"):
+        state["cfg"] = model.config.use_cache
+        model.config.use_cache = False
+    if hasattr(model, "generation_config") and hasattr(model.generation_config, "use_cache"):
+        state["gen"] = model.generation_config.use_cache
+        model.generation_config.use_cache = False
+    return state
 
+
+def _restore_kv_cache(model, state: Dict[str, Any]):
+    if state.get("cfg") is not None and hasattr(model, "config") and hasattr(model.config, "use_cache"):
+        model.config.use_cache = state["cfg"]
+    if state.get("gen") is not None and hasattr(model, "generation_config") and hasattr(model.generation_config, "use_cache"):
+        model.generation_config.use_cache = state["gen"]
+
+
+def _extract_graph_module(obj: Any) -> Optional[torch.fx.GraphModule]:
+    # Common patterns across torch.export / aot outputs
+    if isinstance(obj, torch.fx.GraphModule):
+        return obj
+    for attr in ["graph_module", "gm", "module", "graph"]:
+        if hasattr(obj, attr):
+            v = getattr(obj, attr)
+            if isinstance(v, torch.fx.GraphModule):
+                return v
+    # exported program: obj.graph_module may exist
+    if hasattr(obj, "module") and isinstance(getattr(obj, "module"), torch.fx.GraphModule):
+        return getattr(obj, "module")
+    return None
+
+
+def capture_joint_fx(model, example_inputs: Tuple[torch.Tensor, ...], run_dir: str, save_readable: bool = True) -> Dict[str, Any]:
+    """
+    必须产出 joint fwd+bwd graph（否则档1不成立）。
+    尝试顺序（best-effort）：
+      1) torch.export.aot_export_joint_with_descriptors (若存在)
+      2) torch._functorch.aot_autograd.aot_export_joint_simple (若存在)
+    成功后保存：
+      - run_dir/joint_gm.pt
+      - run_dir/joint_graph.txt
+      - run_dir/joint_export_raw.pkl (完整原始对象)
+      - run_dir/joint_export_raw.json (json-friendly)
+      - run_dir/joint_export_meta.json
+    """
+    meta = {
+        "torch": torch.__version__,
+        "status": None,
+        "method": None,
+        "note": None,
+    }
+
+    input_ids = example_inputs[0]
+
+    # loss fn：必须能产生对参数的梯度 => 返回 loss 标量
+    def loss_fn(input_ids_):
+        out = model(input_ids=input_ids_, use_cache=False, return_dict=True)
+        loss = out.logits.float().mean()
+        return loss
+
+    st = _disable_kv_cache(model)
+    t0 = time.perf_counter()
+    raw = None
+    gm = None
     try:
-        with torch.no_grad():
-            # ---- Force-disable cache at config level (both config and generation_config if present) ----
-            orig_cfg_use_cache = None
-            orig_gen_use_cache = None
-
-            if hasattr(model, "config") and hasattr(model.config, "use_cache"):
-                orig_cfg_use_cache = model.config.use_cache
-                model.config.use_cache = False
-
-            if hasattr(model, "generation_config") and hasattr(model.generation_config, "use_cache"):
-                orig_gen_use_cache = model.generation_config.use_cache
-                model.generation_config.use_cache = False
-
-            try:
-                input_ids = example_inputs[0]
-
-                # Wrapper: return ONLY logits (Tensor), never DynamicCache/past_key_values
-                def _fw(input_ids_):
-                    out = model(input_ids=input_ids_, use_cache=False, return_dict=True)
-                    return out.logits
-
-                exported = torch._dynamo.export(_fw, input_ids, aten_graph=True)
-                fwd_gm = exported[0] if isinstance(exported, tuple) else exported
-
-            finally:
-                # restore cache flags
-                if orig_cfg_use_cache is not None:
-                    model.config.use_cache = orig_cfg_use_cache
-                if orig_gen_use_cache is not None:
-                    model.generation_config.use_cache = orig_gen_use_cache
-
-        meta["status"] = "ok_fwd_fx"
-
-    except Exception as e:
-        meta["status"] = "fail"
-        meta["note"] = repr(e)
-        raise RuntimeError(
-            "Failed to capture FX via torch._dynamo.export. "
-            "On torch 2.11 dev, this commonly happens if outputs include non-Tensor objects "
-            "(e.g., transformers DynamicCache)."
-        ) from e
-
-    meta["capture_time_s"] = time.perf_counter() - t0
-
-    if save_fx_path:
-        ensure_dir(os.path.dirname(save_fx_path))
-        torch.save(fwd_gm, save_fx_path)
-
-    if save_fx_readable_path:
+        # Try torch.export API
         try:
-            write_text(save_fx_readable_path, str(fwd_gm.graph))
+            import torch.export as texp  # type: ignore
+
+            if hasattr(texp, "aot_export_joint_with_descriptors"):
+                meta["method"] = "torch.export.aot_export_joint_with_descriptors"
+                raw = texp.aot_export_joint_with_descriptors(loss_fn, (input_ids,), {})
+                gm = _extract_graph_module(raw)
         except Exception as e:
-            write_text(save_fx_readable_path, f"[failed to write readable fx graph] {repr(e)}")
+            meta["note"] = f"[torch.export attempt failed] {repr(e)}"
 
-    return {"gm": fwd_gm, "meta": meta}
+        # Try functorch fallback
+        if gm is None:
+            try:
+                from torch._functorch.aot_autograd import aot_export_joint_simple  # type: ignore
 
+                meta["method"] = "torch._functorch.aot_autograd.aot_export_joint_simple"
+                raw = aot_export_joint_simple(loss_fn, (input_ids,))
+                gm = _extract_graph_module(raw)
+            except Exception as e:
+                meta["note"] = (meta["note"] or "") + f" | [aot_export_joint_simple failed] {repr(e)}"
+
+        if gm is None:
+            meta["status"] = "fail_no_graphmodule"
+            raise RuntimeError(
+                "Joint export did not yield a torch.fx.GraphModule. "
+                "See joint_export_meta.json and joint_export_raw.* for details."
+            )
+
+        meta["status"] = "ok_joint_fx"
+        meta["capture_time_s"] = time.perf_counter() - t0
+
+        # Save artifacts (maximal)
+        write_json(os.path.join(run_dir, "joint_export_meta.json"), meta)
+
+        try:
+            torch.save(gm, os.path.join(run_dir, "joint_gm.pt"))
+        except Exception as e:
+            write_text(os.path.join(run_dir, "joint_gm_save_error.txt"), repr(e))
+
+        if save_readable:
+            try:
+                write_text(os.path.join(run_dir, "joint_graph.txt"), str(gm.graph))
+            except Exception as e:
+                write_text(os.path.join(run_dir, "joint_graph.txt"), f"[failed] {repr(e)}")
+
+        if raw is not None:
+            pkl_info = try_torch_save(os.path.join(run_dir, "joint_export_raw.pkl"), raw)
+            write_json(os.path.join(run_dir, "joint_export_raw_save.json"), pkl_info)
+            try:
+                write_json(os.path.join(run_dir, "joint_export_raw.json"), _json_friendly(raw, max_depth=6))
+            except Exception as e:
+                write_json(os.path.join(run_dir, "joint_export_raw.json"), {"__error__": repr(e), "repr": repr(raw)[:2000]})
+
+        return {"gm": gm, "meta": meta}
+
+    finally:
+        _restore_kv_cache(model, st)
 
 
 # -----------------------------
-# Solver/compile shim (real autoparallel if available)
+# Worth assessment (no profiling)
 # -----------------------------
-def try_autoparallel_solve(gm, example_inputs, mesh_shape, run_dir):
+def _to_float(x) -> Optional[float]:
+    if x is None:
+        return None
+    if isinstance(x, (int, float)) and not isinstance(x, bool):
+        return float(x)
+    s = str(x)
+    # parse first float-like token
+    import re
+    m = re.search(r"[-+]?\d+(\.\d+)?([eE][-+]?\d+)?", s)
+    if not m:
+        return None
+    try:
+        return float(m.group(0))
+    except Exception:
+        return None
+
+
+def _safe_div(a: Optional[float], b: Optional[float]) -> Optional[float]:
+    if a is None or b is None or b == 0:
+        return None
+    return a / b
+
+
+def assess_worth(solve_status: str, timeout: bool, fallback: bool, costs: Dict[str, Any]) -> Dict[str, Any]:
     """
-    统一返回结构（尽量保持你原风格）：
-      {
-        solve_status, solve_time_s, timeout, fallback,
-        scale: {num_vars, num_constraints, num_candidates},
-        costs: {compute, comm, reshard, memory},
-        strategy: <raw or best-effort>,
-        raw_repr: ...,
-        out_json: ... (json-friendly best-effort),
-        out_pickle: ... (torch.save result),
-      }
+    非 profiling 的直观判定：green/yellow/red
+    依据：compute/comm/reshard 的占比结构（以及 timeout/fallback）。
+    """
+    status = (solve_status or "").lower()
+    if timeout:
+        return {"verdict": "red", "reasons": ["timeout"], "recommendation": "Reduce candidate space / smaller graph / raise timeout."}
+    if "error" in status or status in {"fail"}:
+        return {"verdict": "red", "reasons": [f"status={solve_status}"], "recommendation": "Fix solver/export issues first."}
+    if fallback:
+        return {"verdict": "red", "reasons": [f"fallback ({solve_status})"], "recommendation": "Ensure solver produces real strategy/costs."}
 
-    注意：本文件只做“实验记录”，不做策略优劣判断。
+    c_compute = _to_float(costs.get("compute"))
+    c_comm = _to_float(costs.get("comm"))
+    c_reshard = _to_float(costs.get("reshard"))
+    parts = [v for v in [c_compute, c_comm, c_reshard] if v is not None]
+    total = sum(parts) if parts else None
+    if total is None or total <= 0:
+        return {"verdict": "yellow", "reasons": ["missing_costs"], "recommendation": "Expose numeric cost breakdown."}
+
+    reshard_share = _safe_div(c_reshard, total)
+    comm_share = _safe_div(c_comm, total)
+
+    verdict = "green"
+    reasons = []
+
+    if reshard_share is not None:
+        if reshard_share > 0.30:
+            verdict = "red"
+            reasons.append(f"reshard_share={reshard_share:.2f} (>0.30)")
+        elif reshard_share > 0.15:
+            verdict = "yellow"
+            reasons.append(f"reshard_share={reshard_share:.2f} (>0.15)")
+
+    if verdict != "red" and comm_share is not None and comm_share > 0.60:
+        verdict = "yellow"
+        reasons.append(f"comm_share={comm_share:.2f} (>0.60)")
+
+    if not reasons:
+        reasons.append("no obvious structural red flags in cost breakdown")
+
+    rec = {
+        "green": "Proceed to minimal runtime validation; profiling later if needed.",
+        "yellow": "Worth limited validation; try reduce reshard/comm if possible.",
+        "red": "Not worth profiling yet; address reshard/solver feasibility first.",
+    }[verdict]
+
+    return {"verdict": verdict, "reasons": reasons, "recommendation": rec, "reshard_share": reshard_share, "comm_share": comm_share, "total_cost": total}
+
+
+# -----------------------------
+# Solver shim (autoparallel)
+# -----------------------------
+def try_autoparallel_solve(gm, mesh_shape: List[int], run_dir: str) -> Dict[str, Any]:
+    """
+    尽量兼容不同 autoparallel API：
+    - import autoparallel / autoparallel.api / autoparallel.solver
+    - 探测入口函数名
+    - 调用并记录 raw/pickle/json-friendly
     """
     t0 = time.perf_counter()
 
-    # 尝试导入 autoparallel（如果你本机装了 meta-pytorch/autoparallel）
     ap = None
     ap_import_name = None
     for name in ["autoparallel", "autoparallel.api", "autoparallel.solver"]:
@@ -404,24 +473,28 @@ def try_autoparallel_solve(gm, example_inputs, mesh_shape, run_dir):
 
     if ap is None:
         return {
-            "solve_status": "offline_no_autoparallel",
+            "solve_status": "no_autoparallel",
             "solve_time_s": time.perf_counter() - t0,
             "timeout": False,
             "fallback": True,
             "scale": {"num_vars": None, "num_constraints": None, "num_candidates": None},
             "costs": {"compute": None, "comm": None, "reshard": None, "memory": None},
-            "strategy": {"note": "autoparallel not installed; offline placeholder"},
+            "strategy": None,
             "raw_repr": "",
-            "out_json": None,
-            "out_pickle": None,
             "autoparallel_import": None,
             "autoparallel_entry": None,
         }
 
-    # 入口函数名做容错探测
     entry = None
     entry_name = None
-    for fn in ["solve", "autoparallel_solve", "auto_parallelize", "autoparallelize", "run_autoparallel", "compile_autoparallel"]:
+    for fn in [
+        "solve",
+        "autoparallel_solve",
+        "auto_parallelize",
+        "autoparallelize",
+        "run_autoparallel",
+        "compile_autoparallel",
+    ]:
         if hasattr(ap, fn):
             entry = getattr(ap, fn)
             entry_name = fn
@@ -435,25 +508,26 @@ def try_autoparallel_solve(gm, example_inputs, mesh_shape, run_dir):
             "fallback": True,
             "scale": {"num_vars": None, "num_constraints": None, "num_candidates": None},
             "costs": {"compute": None, "comm": None, "reshard": None, "memory": None},
-            "strategy": {"note": "autoparallel imported but no known entry; wire in manually"},
+            "strategy": None,
             "raw_repr": "",
-            "out_json": None,
-            "out_pickle": None,
             "autoparallel_import": ap_import_name,
             "autoparallel_entry": None,
         }
 
-    # 调入口（你可能需要按你本地 autoparallel 签名微调 kwargs）
     out = None
     call_note = None
     try:
-        out = entry(gm, mesh_shape=mesh_shape, example_inputs=example_inputs, run_dir=run_dir)
-        call_note = "called entry(gm, mesh_shape=..., example_inputs=..., run_dir=...)"
+        # Best-effort signature
+        out = entry(gm, mesh_shape=mesh_shape, run_dir=run_dir)
+        call_note = "called entry(gm, mesh_shape=..., run_dir=...)"
     except TypeError:
-        out = entry(gm)
-        call_note = "called entry(gm) (fallback signature)"
+        try:
+            out = entry(gm, mesh_shape=mesh_shape)
+            call_note = "called entry(gm, mesh_shape=...)"
+        except TypeError:
+            out = entry(gm)
+            call_note = "called entry(gm)"
     except Exception as e:
-        # 保持记录完整：把异常也记录下来
         return {
             "solve_status": "error",
             "error": repr(e),
@@ -462,30 +536,13 @@ def try_autoparallel_solve(gm, example_inputs, mesh_shape, run_dir):
             "fallback": False,
             "scale": {"num_vars": None, "num_constraints": None, "num_candidates": None},
             "costs": {"compute": None, "comm": None, "reshard": None, "memory": None},
-            "strategy": {"note": "exception raised during entry() call"},
+            "strategy": None,
             "raw_repr": "",
-            "out_json": None,
-            "out_pickle": None,
             "autoparallel_import": ap_import_name,
             "autoparallel_entry": entry_name,
             "call_note": call_note,
         }
 
-    res = {
-        "solve_status": "ok",
-        "solve_time_s": time.perf_counter() - t0,
-        "timeout": False,
-        "fallback": False,
-        "scale": {},
-        "costs": {},
-        "strategy": {},
-        "raw_repr": repr(out)[:4000],  # 记录更长一些，便于后续分析
-        "autoparallel_import": ap_import_name,
-        "autoparallel_entry": entry_name,
-        "call_note": call_note,
-    }
-
-    # 尽量从 out 中扒 scale/costs/strategy（字段名按常见别名探测）
     def pick(obj, keys):
         if isinstance(obj, dict):
             for k in keys:
@@ -496,44 +553,45 @@ def try_autoparallel_solve(gm, example_inputs, mesh_shape, run_dir):
                 return getattr(obj, k)
         return None
 
-    res["scale"]["num_vars"] = pick(out, ["num_vars", "n_vars", "variables", "n_variables"])
-    res["scale"]["num_constraints"] = pick(out, ["num_constraints", "n_constraints", "constraints", "n_cons"])
-    res["scale"]["num_candidates"] = pick(out, ["num_candidates", "n_candidates", "candidates", "n_cands"])
+    res = {
+        "solve_status": "ok",
+        "solve_time_s": time.perf_counter() - t0,
+        "timeout": False,
+        "fallback": False,
+        "scale": {
+            "num_vars": pick(out, ["num_vars", "n_vars", "variables", "n_variables"]),
+            "num_constraints": pick(out, ["num_constraints", "n_constraints", "constraints", "n_cons"]),
+            "num_candidates": pick(out, ["num_candidates", "n_candidates", "candidates", "n_cands"]),
+        },
+        "costs": {
+            "compute": pick(out, ["compute_cost", "compute", "flops_cost"]),
+            "comm": pick(out, ["comm_cost", "comm", "communication_cost"]),
+            "reshard": pick(out, ["reshard_cost", "redistribute_cost", "reshard"]),
+            "memory": pick(out, ["memory_cost", "memory", "peak_memory"]),
+        },
+        "strategy": pick(out, ["strategy"]) if pick(out, ["strategy"]) is not None else (out if isinstance(out, dict) else None),
+        "raw_repr": repr(out)[:6000],
+        "autoparallel_import": ap_import_name,
+        "autoparallel_entry": entry_name,
+        "call_note": call_note,
+    }
 
-    res["costs"]["compute"] = pick(out, ["compute_cost", "compute", "flops_cost"])
-    res["costs"]["comm"] = pick(out, ["comm_cost", "comm", "communication_cost"])
-    res["costs"]["reshard"] = pick(out, ["reshard_cost", "redistribute_cost", "reshard"])
-    res["costs"]["memory"] = pick(out, ["memory_cost", "memory", "peak_memory"])
-
-    strat = pick(out, ["strategy"])
-    if strat is None and isinstance(out, dict):
-        strat = out
-    res["strategy"] = strat if strat is not None else {"note": "strategy not found; inspect raw_repr"}
-
-    # 记录：JSON 友好形式（best-effort）
+    # Persist raw outputs
     try:
-        res["out_json"] = _json_friendly(out, max_depth=6)
-    except Exception as e:
-        res["out_json"] = {"__error__": repr(e), "repr": repr(out)[:2000]}
-
-    # 记录：尽力保存完整对象（pickle）
-    pkl_path = os.path.join(run_dir, "autoparallel_out.pkl")
-    res["out_pickle"] = try_torch_save(pkl_path, out)
-
-    # 同时把 json-friendly 落盘（失败也不影响主流程）
-    try:
-        write_json(os.path.join(run_dir, "autoparallel_out.json"), res["out_json"])
+        write_json(os.path.join(run_dir, "autoparallel_out.json"), _json_friendly(out, max_depth=6))
     except Exception as e:
         write_json(os.path.join(run_dir, "autoparallel_out.json"), {"__error__": repr(e), "repr": repr(out)[:2000]})
+
+    pkl_info = try_torch_save(os.path.join(run_dir, "autoparallel_out.pkl"), out)
+    write_json(os.path.join(run_dir, "autoparallel_out_save.json"), pkl_info)
 
     return res
 
 
 # -----------------------------
-# Timeout runner (single-file)
+# Timeout runner
 # -----------------------------
-def run_with_timeout(fn, timeout_s: int):
-    # 用 multiprocessing 来硬超时（Windows 下也可用，但注意 spawn 开销）
+def run_with_timeout(fn, timeout_s: int) -> Dict[str, Any]:
     import multiprocessing as mp
 
     def _worker(q):
@@ -562,12 +620,8 @@ def run_with_timeout(fn, timeout_s: int):
             "solve_time_s": float(timeout_s),
             "scale": {"num_vars": None, "num_constraints": None, "num_candidates": None},
             "costs": {"compute": None, "comm": None, "reshard": None, "memory": None},
-            "strategy": {"note": "timeout"},
+            "strategy": None,
             "raw_repr": "",
-            "out_json": None,
-            "out_pickle": None,
-            "autoparallel_import": None,
-            "autoparallel_entry": None,
         }
 
     if q.empty():
@@ -578,57 +632,41 @@ def run_with_timeout(fn, timeout_s: int):
             "solve_time_s": None,
             "scale": {"num_vars": None, "num_constraints": None, "num_candidates": None},
             "costs": {"compute": None, "comm": None, "reshard": None, "memory": None},
-            "strategy": {"note": "no payload"},
+            "strategy": None,
             "raw_repr": "",
-            "out_json": None,
-            "out_pickle": None,
-            "autoparallel_import": None,
-            "autoparallel_entry": None,
         }
 
-    status, payload = q.get()
+    _, payload = q.get()
     payload.setdefault("timeout", False)
     payload.setdefault("fallback", False)
     payload.setdefault("scale", {"num_vars": None, "num_constraints": None, "num_candidates": None})
     payload.setdefault("costs", {"compute": None, "comm": None, "reshard": None, "memory": None})
-    payload.setdefault("strategy", {"note": "missing"})
+    payload.setdefault("strategy", None)
     payload.setdefault("raw_repr", "")
-    payload.setdefault("out_json", None)
-    payload.setdefault("out_pickle", None)
-    payload.setdefault("autoparallel_import", None)
-    payload.setdefault("autoparallel_entry", None)
     return payload
 
 
 # -----------------------------
-# Mesh sensitivity (record-only, no judgement)
+# Optional: mesh dim swap sensitivity (record-only)
 # -----------------------------
-def dim_permute_sensitivity_record(gm, example_inputs, mesh_shape, run_dir):
-    """
-    仅记录：swap mesh 前两维后，solver 输出的关键摘要是否发生变化。
-    不做“好坏”判断；后续分析脚本再解释。
-    """
+def dim_permute_sensitivity_record(gm, mesh_shape: List[int], run_dir: str, timeout_s: int) -> Dict[str, Any]:
     if len(mesh_shape) < 2:
         return {"supported": False}
 
     perm = list(mesh_shape)
     perm[0], perm[1] = perm[1], perm[0]
 
-    base = try_autoparallel_solve(gm, example_inputs, mesh_shape, run_dir)
-    alt = try_autoparallel_solve(gm, example_inputs, perm, run_dir)
+    def solve_base():
+        return try_autoparallel_solve(gm, mesh_shape, run_dir)
 
-    base_sig = {
-        "solve_status": base.get("solve_status"),
-        "scale": base.get("scale"),
-        "costs": base.get("costs"),
-        "raw": (base.get("raw_repr", "")[:800] if base.get("raw_repr") else ""),
-    }
-    alt_sig = {
-        "solve_status": alt.get("solve_status"),
-        "scale": alt.get("scale"),
-        "costs": alt.get("costs"),
-        "raw": (alt.get("raw_repr", "")[:800] if alt.get("raw_repr") else ""),
-    }
+    def solve_perm():
+        return try_autoparallel_solve(gm, perm, run_dir)
+
+    base = run_with_timeout(solve_base, timeout_s)
+    alt = run_with_timeout(solve_perm, timeout_s)
+
+    base_sig = {"status": base.get("solve_status"), "scale": base.get("scale"), "costs": base.get("costs")}
+    alt_sig = {"status": alt.get("solve_status"), "scale": alt.get("scale"), "costs": alt.get("costs")}
 
     return {
         "supported": True,
@@ -637,48 +675,39 @@ def dim_permute_sensitivity_record(gm, example_inputs, mesh_shape, run_dir):
         "changed": base_sig != alt_sig,
         "base_sig": base_sig,
         "perm_sig": alt_sig,
-        "note": "Record-only. Use analysis script to interpret sensitivity.",
     }
 
 
 # -----------------------------
-# Main (experiment + record)
+# Main
 # -----------------------------
 def main():
     p = argparse.ArgumentParser()
 
-    # 你原有参数（保持）
-    p.add_argument("--model_path", required=True, help="Local path or HF id for Llama3-8B")
-    p.add_argument("--mesh", default="", help="Single mesh: 64 | 8x8 | 4x16 | 4x4x4")
-    p.add_argument("--meshes", default="", help="Comma-separated meshes to batch run, e.g. 64,8x8,4x16")
+    p.add_argument("--model_path", required=True)
+    p.add_argument("--mesh", default="")
+    p.add_argument("--meshes", default="")
     p.add_argument("--outdir", default="outputs")
     p.add_argument("--timeout_s", type=int, default=1800)
 
-    # CPU-only graph/compile: 强烈建议 tiny seq/batch
     p.add_argument("--device", default="cpu", choices=["cpu"])
     p.add_argument("--dtype", default="fp32", choices=["fp32", "bf16", "fp16"])
     p.add_argument("--batch", type=int, default=1)
     p.add_argument("--seq_len", type=int, default=16)
 
-    # 落盘控制：默认极简（但本脚本会额外记录更多原始文件，便于后续分析）
-    p.add_argument("--save_fx", type=int, default=0, help="1 to save fx graphmodule (.pt). default 0")
-    p.add_argument("--save_fx_readable", type=int, default=1, help="1 to save a readable fx graph text file. default 1")
+    # 必须 joint
+    p.add_argument("--capture_joint", type=int, default=1, help="1=must capture joint fwd+bwd graph; fail stops. default 1")
+
+    # 输出控制
     p.add_argument("--write_csv", type=int, default=1)
-    p.add_argument("--debug_dump", type=int, default=0, help="1 to dump extra raw objects (may be large)")
+    p.add_argument("--record_env", type=int, default=1)
+    p.add_argument("--save_joint_readable", type=int, default=1)
 
-    # 记录额外环境信息（建议保持 1）
-    p.add_argument("--record_env", type=int, default=1, help="1 to record pip freeze and torch env info. default 1")
-
-    # mesh 维度 swap 敏感性（会额外做一次求解；纯记录，不分析）
+    # 可选：mesh swap 敏感性（会额外做两次 solve）
     p.add_argument("--do_dim_permute_sensitivity", type=int, default=1)
 
-    # 内存节省：默认不启用，避免影响 autoparallel 测试稳定性
-    p.add_argument(
-        "--allow_cpu_low_precision",
-        type=int,
-        default=0,
-        help="1 to allow bf16/fp16 on CPU (may reduce memory; may affect export/ops support). Default 0 keeps fp32.",
-    )
+    # 内存节省开关（默认关，避免影响稳定性）
+    p.add_argument("--allow_cpu_low_precision", type=int, default=0)
 
     args = p.parse_args()
 
@@ -691,19 +720,9 @@ def main():
     if args.mesh:
         mesh_list.append(args.mesh.strip())
 
-    # Load model once (成本很高，别在每个 mesh 重复加载)
-    model, tok = load_llama3(
-        args.model_path,
-        device=args.device,
-        dtype=args.dtype,
-        allow_cpu_low_precision=bool(args.allow_cpu_low_precision),
-    )
-    example_inputs = build_example_inputs(tok, args.batch, args.seq_len, device=args.device)
+    ensure_dir(args.outdir)
 
-    # Capture once（图本身与 mesh 无关；mesh 只影响 placements/求解）
-    fx_cache = None
-
-    # 全局记录：环境、版本、命令行参数（只写一次，放 outdir 根目录）
+    # 记录环境（只做一次）
     if args.record_env:
         write_text(os.path.join(args.outdir, "pip_freeze.txt"), capture_pip_freeze())
         write_text(os.path.join(args.outdir, "torch_env.txt"), capture_torch_env())
@@ -722,16 +741,45 @@ def main():
         },
     )
 
-    # 每个 mesh 逐个 run
+    # Load model once
+    model, tok = load_llama3(
+        args.model_path,
+        device=args.device,
+        dtype=args.dtype,
+        allow_cpu_low_precision=bool(args.allow_cpu_low_precision),
+    )
+    example_inputs = build_example_inputs(tok, args.batch, args.seq_len, device=args.device)
+
+    # 先生成一次 joint graph（与 mesh 无关）：
+    # 为满足“档1必须 joint”，若失败则直接退出（但会把失败信息落盘到 outdir 根目录）。
+    joint_cache = None
+    if args.capture_joint:
+        # 放到一个稳定位置：outdir/_joint_capture/<ts>/
+        joint_dir = os.path.join(args.outdir, "_joint_capture", datetime.utcnow().strftime("%Y%m%d_%H%M%S"))
+        ensure_dir(joint_dir)
+        write_json(os.path.join(joint_dir, "example_inputs.json"), example_inputs_meta(example_inputs))
+        try:
+            joint_cache = capture_joint_fx(model, example_inputs, run_dir=joint_dir, save_readable=bool(args.save_joint_readable))
+        except Exception as e:
+            # 落盘失败原因并退出（符合“必须 joint”）
+            write_json(
+                os.path.join(joint_dir, "joint_capture_failed.json"),
+                {"ok": False, "error": repr(e), "torch": torch.__version__},
+            )
+            raise
+
+    gm_joint = joint_cache["gm"]
+    joint_meta = joint_cache["meta"]
+
+    # 每个 mesh：调用 solver（输入 joint graph）
     for mesh_str in mesh_list:
         mesh_shape = parse_mesh(mesh_str)
         tag = mesh_tag(mesh_shape)
         run_dir = make_run_dir(args.outdir, tag)
 
-        # 记录 meta（尽量全）
         meta = {
             "mesh": {"raw": mesh_str, "shape": mesh_shape, "tag": tag},
-            "time": datetime.utcnow().isoformat() + "Z",
+            "time_utc": datetime.utcnow().isoformat() + "Z",
             "host": {
                 "platform": platform.platform(),
                 "python": platform.python_version(),
@@ -743,45 +791,44 @@ def main():
                 "device": args.device,
                 "allow_cpu_low_precision": bool(args.allow_cpu_low_precision),
             },
-            "capture": {"batch": args.batch, "seq_len": args.seq_len},
+            "capture": {"batch": args.batch, "seq_len": args.seq_len, "joint": True},
+            "joint_capture_meta": joint_meta,
             "run_dir": run_dir,
             "argv": sys.argv,
         }
-
-        # 记录 example inputs meta
-        write_json(os.path.join(run_dir, "example_inputs.json"), example_inputs_meta(example_inputs))
-
-        # capture fx once
-        if fx_cache is None:
-            fx_pt_path = os.path.join(run_dir, "fx.pt") if args.save_fx else ""
-            fx_txt_path = os.path.join(run_dir, "fx_readable.txt") if args.save_fx_readable else ""
-            fx_cache = capture_fx(model, example_inputs, save_fx_path=fx_pt_path, save_fx_readable_path=fx_txt_path)
-        else:
-            # 若 save_fx=1 但你希望每个 mesh 都落一份 fx，也可以在这里复制；默认不做
-            pass
-
-        gm = fx_cache["gm"]
-        meta["fx_meta"] = fx_cache["meta"]
-
-        # 先写 meta，确保中断也有记录
         write_json(os.path.join(run_dir, "meta.json"), meta)
+
+        # 为每个 run_dir 再保存一份 joint graph 的只读引用信息（不复制大 pt）
+        write_json(
+            os.path.join(run_dir, "joint_reference.json"),
+            {
+                "joint_capture_dir": os.path.dirname(os.path.join(args.outdir, "_joint_capture")),
+                "note": "Joint artifacts saved under outdir/_joint_capture/<ts>/ (gm.pt, graph.txt, raw.pkl, meta.json).",
+            },
+        )
 
         t_all0 = time.perf_counter()
 
-        # solve with timeout
         def solve_fn():
-            return try_autoparallel_solve(gm, example_inputs, mesh_shape, run_dir)
+            return try_autoparallel_solve(gm_joint, mesh_shape, run_dir)
 
         solve_res = run_with_timeout(solve_fn, args.timeout_s)
 
-        # dim permute sensitivity record (optional; extra solve)
+        # 非 profiling 判断
+        worth = assess_worth(
+            solve_status=str(solve_res.get("solve_status")),
+            timeout=bool(solve_res.get("timeout", False)),
+            fallback=bool(solve_res.get("fallback", False)),
+            costs=solve_res.get("costs", {}) or {},
+        )
+
+        # dim swap 记录（可选）
         sens = None
         if args.do_dim_permute_sensitivity and len(mesh_shape) >= 2:
-            sens = dim_permute_sensitivity_record(gm, example_inputs, mesh_shape, run_dir)
+            sens = dim_permute_sensitivity_record(gm_joint, mesh_shape, run_dir, timeout_s=args.timeout_s)
 
         total_s = time.perf_counter() - t_all0
 
-        # 记录汇总（注意：这里只是“实验记录”，不做任何好坏判断）
         summary = {
             "mesh_tag": tag,
             "mesh_shape": mesh_shape,
@@ -791,19 +838,26 @@ def main():
             "fallback": bool(solve_res.get("fallback", False)),
             "scale": solve_res.get("scale", {}),
             "costs": solve_res.get("costs", {}),
-            # 原始信息保留：repr + json-friendly + pickle 保存结果
             "raw_repr": solve_res.get("raw_repr", ""),
             "autoparallel_import": solve_res.get("autoparallel_import"),
             "autoparallel_entry": solve_res.get("autoparallel_entry"),
             "call_note": solve_res.get("call_note"),
-            "out_pickle": solve_res.get("out_pickle"),
             "dim_sensitivity": sens,
             "total_time_s": total_s,
             "run_dir": run_dir,
-            "meta_path": os.path.join(run_dir, "meta.json"),
+            # 关键：不 profiling 也能看出策略是否“结构上”优质
+            "worth_verdict": worth.get("verdict"),
+            "worth_reasons": worth.get("reasons"),
+            "worth_recommendation": worth.get("recommendation"),
+            "derived": {
+                "total_cost": worth.get("total_cost"),
+                "reshard_share": worth.get("reshard_share"),
+                "comm_share": worth.get("comm_share"),
+            },
+            # joint capture meta（用于证明该 run 是 joint）
+            "joint_capture": {"status": joint_meta.get("status"), "method": joint_meta.get("method")},
         }
 
-        # 每个 mesh 写 summary.json；全局聚合写 runs.jsonl（可用于后续分析脚本读取）
         write_json(os.path.join(run_dir, "summary.json"), summary)
         append_jsonl(os.path.join(args.outdir, "runs.jsonl"), summary)
 
@@ -824,19 +878,15 @@ def main():
                     "comm_cost": summary["costs"].get("comm", ""),
                     "reshard_cost": summary["costs"].get("reshard", ""),
                     "memory_cost": summary["costs"].get("memory", ""),
+                    "worth_verdict": summary["worth_verdict"],
+                    "reshard_share": summary["derived"].get("reshard_share", ""),
+                    "comm_share": summary["derived"].get("comm_share", ""),
                     "total_time_s": total_s,
                     "run_dir": run_dir,
                 },
             )
 
-        if args.debug_dump:
-            # 可选：把更深的 json-friendly out 落盘（可能较大）
-            try:
-                write_json(os.path.join(run_dir, "autoparallel_out_deep.json"), _json_friendly(solve_res.get("strategy"), max_depth=8))
-            except Exception as e:
-                write_json(os.path.join(run_dir, "autoparallel_out_deep.json"), {"__error__": repr(e)})
-
-        print(f"[OK] mesh={tag} -> {run_dir}")
+        print(f"[OK] mesh={tag} verdict={summary['worth_verdict']} -> {run_dir}")
 
 
 if __name__ == "__main__":
