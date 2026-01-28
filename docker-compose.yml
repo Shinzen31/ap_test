@@ -1,5 +1,15 @@
 services:
   ap:
+    # ====================== CPU HARD LIMIT (OPTIONAL) ======================
+    # Hard cgroup-level cap. Remove these lines to cancel the strict limit.
+    # Set this to (host_nproc * 0.4). Examples:
+    # - host nproc=64  -> cpus: "25.6"
+    # - host nproc=96  -> cpus: "38.4"
+    cpus: "22.4"
+    # Alternatively, pin to a subset of cores (also hard cap style):
+    # cpuset: "0-25"
+    # ======================================================================
+
     build:
       context: .
       network: host
@@ -8,11 +18,13 @@ services:
         https_proxy: "http://127.0.0.1:3128"
         no_proxy: "${no_proxy}"
 
-        TORCH_INDEX_URL: "https://download.pytorch.org/whl/nightly/cpu"
-        TORCH_VERSION: "2.11.0.dev20260121+cpu"
+        TORCH_VERSION: "2.8.0.dev20250506+cpu"
         PYTHON_VERSION: "3.11"
 
-    image: ap-llama3-cpu:torch-2.11.0.dev20260121
+        # Optional: matches Dockerfile default (40). Keep/remove both OK.
+        CPU_LIMIT_PERCENT: "40"
+
+    image: ap-llama3-cpu:torch-2.8.0-dev20250506
     network_mode: host
     working_dir: /workspace
     shm_size: "8g"
